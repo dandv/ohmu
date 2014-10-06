@@ -24,78 +24,174 @@ struct Block;
 struct Instruction;
 struct Use;
 
+
+// EQ_OQ(EQ) 0H Equal(ordered, non - signaling) False False True False No
+// UNORD_Q(UNORD) 3H Unordered(non - signaling) False False False True No
+// NEQ_UQ(NEQ) 4H Not - equal(unordered, nonsignaling) True True False True No
+// ORD_Q(ORD) 7H Ordered(non - signaling) True True True False No
+// EQ_UQ 8H Equal(unordered, non - signaling) False False True True No
+// FALSE_OQ(FALSE) BH False(ordered, non - signaling) False False False False No
+// NEQ_OQ CH Not - equal(ordered, non - signaling) True True False False No
+// TRUE_UQ(TRUE) FH True(unordered, non - signaling) True True True True No
+// LT_OQ 11H Less - than(ordered, nonsignaling) False True False False No
+// LE_OQ 12H Less - than - or - equal(ordered, nonsignaling) False True True False No
+// NLT_UQ 15H Not - less - than(unordered, nonsignaling) True False True True No
+// NLE_UQ 16H Not - less - than - or - equal(unordered, nonsignaling) True False False True No
+// NGE_UQ 19H Not - greater - than - or - equal(unordered, nonsignaling) False True False True No
+// NGT_UQ 1AH Not - greater - than(unordered, nonsignaling) False True True True No
+// GE_OQ 1DH Greater - than - or - equal(ordered, nonsignaling) True False True False No
+// GT_OQ 1EH Greater - than(ordered, nonsignaling) True False False False No
+
+// Instruction families
+
+struct LOGICFamily {
+  bool val00;
+  bool val01;
+  bool val10;
+  bool val11;
+};
+
+struct ADDFamily {
+  bool neg_result;
+  bool neg_arg1;
+  // round mode
+};
+
+struct MADFamily {
+  bool neg_result;
+  bool neg_arg1;
+  bool fused;
+  // round mode
+};
+
+struct COPYFamily {
+  bool src_in_mem;
+  bool dst_in_mem;
+  bool unaligned;
+};
+
+struct CVTFamily { // sext, zext, fcvt
+  bool signaling;
+  // round mode
+};
+
+struct ShiftFamily {
+  bool left;
+  bool rotate;
+  bool arithmetic;
+};
+
+struct CMPFamily {
+  bool lt;
+  bool eq;
+  bool gt;
+  bool unord;
+};
+
 struct Opcode {
-  enum {
-    NOP, PHI, HEADER, TIE, COPY,
-    VALUE, LOAD, STORE, GATHER, SCATTER,
+  enum Code {
+    NOP, PHI, HEADER, TIE, COPY, SOURCE, SINK,
+    VALUE, LOAD, STORE, ULOAD, USTORE, GATHER, SCATTER,
     SEXT, ZEXT, FCVT, /* ZEXT/FCVT used for truncation */
-    AND, OR, ANDN, ORN, XOR, XNOR, NOT,
+    AND, OR, ANDN, ORN, XOR, XNOR, NAND, NOR, NOT,
     SLL, SLR, SAR, ROL, ROR,
     MIN, MAX,
     ADD, SUB, SUBR, ADDN, ADC, SBB, NEG, ABS,
     MUL, MULHI, DIV, MOD, RCP,
-    LEA,
+    AOS, AOSOA,
     MADD, MSUB, MSUBR, MADDN,
     FMADD, FMSUB, FMSUBR, FMADDN,
-    EQ, LT, LE, UNORD, NEQ, NLT, NLE, ORD,
+    EQ, NEQ, LT, LE, ORD, EQU, NEQU, LTU, LEU, UNORD,
     JUMP, BRANCH, CALL, RET,
     BT, BTS, BTR, BTC,
     CTZ, CLZ, POPCNT, /* other bit ops bmi1/bmi2 */
     SQRT, RSQRT,
     SHUFFLE, BROADCAST, EXTRACT, INSERT,
+    MEMSET, MEMCPY,
+  };
+  struct AliasSet {
+    enum Enum {
+      NONE, GENERAL, FLAGS, SIMD, X87, MEMORY
+    };
+  };
+  struct Flags {
+    enum Enum {
+      NO_FLAGS = 0,
+      DOMINATING_HEADER = 1,
+      CONFLICT_PROXY = 1,
+      PHI_PROXY = 1,
+    };
+  };
+  struct Type {
+    enum {
+      BOOLEAN, UNSIGNED, SIGNED, FLOAT
+    };
   };
   //   
   // CRC, AES,
   // MOVEMASK,
   // RDTSC
-  // MEMCPY, MEMSET
   // ATOMICS, EXCHAGE WITH MEMORY, CMPEXCH WITH MEMORY
 
+  Opcode() {}
+  Opcode(Code code, AliasSet::Enum aliasSet, Flags::Enum flags = Flags::NO_FLAGS, unsigned fixedReg = 0) {
+    *(unsigned*)this = 0;
+    this->code = code;
+    this->aliasSet = aliasSet;
+    //this->doCopyArg0 = doCopyArg0;
+    //this->doCopyArg1 = doCopyArg1;
+    this->flags = flags;
+    this->fixedReg = fixedReg;
+  }
+  Opcode& setFlags(Flags::Enum flags) { this->flags = flags; return *this; }
+  bool operator<(const Opcode& a) const { return *(int*)this < *(int*)this; }
+  bool operator==(const Opcode& a) const { return *(int*)this == *(int*)this; }
+  bool operator!=(const Opcode& a) const { return *(int*)this != *(int*)this; }
 
   unsigned code : 8;
 
-  unsigned hasResult : 1;
-  unsigned isDestructive : 1; // always destroys argument 0
-  unsigned isCommutative : 1;
-  unsigned flags : 3; // header kind, rounding mode, ordering
+  unsigned aliasSet : 3;
+  //unsigned doCopyArg0 : 1;
+  //unsigned doCopyArg1 : 1;
+  unsigned flags : 3; // header kind, rounding mode, fp-cmp ordering
 
-  unsigned aliasSet : 2;
-  unsigned type : 2;
-  unsigned hasFixedReg : 1;
-  unsigned fixedReg : 3;
+  //unsigned hasFixedReg : 1;
+  unsigned fixedReg : 8;
+  //unsigned type : 2;
 
+  unsigned _ : 5;
   unsigned isArg0NotLastUse : 1;
   unsigned isArg1NotLastUse : 1;
   unsigned isUnused : 1;
-  unsigned _ : 5;
-
-  bool operator==(const Opcode& a) const { return *(int*)this == *(int*)this; }
-  bool operator!=(const Opcode& a) const { return *(int*)this != *(int*)this; }
 };
 
-struct OpcodeEx : Opcode {
-  unsigned hasFixedRegArg0 : 1;
-  unsigned hasFixedRegArg1 : 1;
-  unsigned registerFileArg0 : 3;
-  unsigned registerFileArg1 : 3;
-  unsigned fixedRegArg0 : 8;
-  unsigned fixedRegArg1 : 8;
-  const char name[16];
-};
+//struct OpcodeInfo {
+//  char name[16];
+//  Opcode opcode;
+//  unsigned hasFixedRegArg0 : 1;
+//  unsigned hasFixedRegArg1 : 1;
+//  unsigned aliasSetArg0 : 3;
+//  unsigned aliasSetArg1 : 3;
+//  unsigned fixedRegArg0 : 8;
+//  unsigned fixedRegArg1 : 8;
+//};
 
 struct Instruction {
-  void init(Opcode opcode) { init(opcode, this); }
-  void init(Opcode opcode, Instruction* arg0) { init(opcode, arg0, this); }
-  void init(Opcode opcode, Instruction* arg0, Instruction* arg1) {
-    init(opcode, arg0, arg1, this);
+  Instruction* init(Opcode opcode) { return init(opcode, this); }
+  Instruction* init(Opcode opcode, Instruction* arg0) {
+    return init(opcode, arg0, this);
   }
-  void init(Opcode opcode, Instruction* arg0, Instruction* arg1,
-            Instruction* key) {
+  Instruction* init(Opcode opcode, Instruction* arg0, Instruction* arg1) {
+    return init(opcode, arg0, arg1, this);
+  }
+  Instruction* init(Opcode opcode, Instruction* arg0, Instruction* arg1,
+                    Instruction* key) {
     this->opcode = opcode;
     this->key = key - this;
     this->arg0 = arg0 - this;
     this->arg1 = arg1 - this;
     order = 0;
+    return this;
   }
 
   Instruction* getKey() { return this + key; }
@@ -145,8 +241,8 @@ struct Block {
 
 
   //Block* parent;
-  //Instruction* instrs;
-  size_t firstInstr;;
+  Instruction* instrs;
+  size_t firstInstr;
   size_t numInstrs;
   //size_t numPhis;
   //size_t numEchos;
@@ -176,22 +272,27 @@ struct Block {
 //  int lastBlockOffset;
 //};
 
+#if 0
 namespace Opcodes {
-  extern OpcodeEx header;
-  extern OpcodeEx headerDominates;
-  extern OpcodeEx nop;
-  extern OpcodeEx jump;
-  extern OpcodeEx branch;
-  extern OpcodeEx intValue;
-  extern OpcodeEx ret;
-  extern OpcodeEx copy;
-  extern OpcodeEx phi;
-  extern OpcodeEx add;
-  extern OpcodeEx mul;
-  extern OpcodeEx cmpeq;
-  extern OpcodeEx cmplt;
-  extern OpcodeEx cmple;
+  extern const OpcodeInfo header;
+  //extern const OpcodeInfo headerDominates;
+  extern const OpcodeInfo nop;
+  extern const OpcodeInfo jump;
+  extern const OpcodeInfo branch;
+  extern const OpcodeInfo intValue;
+  //extern const OpcodeInfo arg0;
+  extern const OpcodeInfo call;
+  extern const OpcodeInfo ret;
+  extern const OpcodeInfo copy;
+  extern const OpcodeInfo phi;
+  extern const OpcodeInfo add;
+  extern const OpcodeInfo mul;
+  extern const OpcodeInfo eq;
+  extern const OpcodeInfo lt;
+  extern const OpcodeInfo le;
+  extern const OpcodeInfo unknown;
 };
+#endif
 
 void print(Instruction* instrs, size_t numInstrs);
 
