@@ -17,13 +17,79 @@
 
 #pragma once
 
-#include "x64builder\x64builder.h"
+//#include "x64builder\x64builder.h"
+
+
+enum {
+  VALUE = 0x80, COPY = 0xc0, FIXED = 0x20, KEY = 0x10, PHI = 0x8f,
+  ALIAS_FLAGS = VALUE, ALIAS_GENERAL, ALIAS_SSE,
+  NOP = 0, USE, MUTED_USE, HEADER, HEADER_DOMINATES,
+  INT32, LOAD, STORE, ULOAD, USTORE, GATHER, SCATTER,
+  SEXT, ZEXT, FCVT, /* ZEXT/FCVT used for truncation */
+  AND, OR, ANDN, ORN, XOR, XNOR, NAND, NOR, NOT,
+  SLL, SLR, SAR, ROL, ROR,
+  MIN, MAX,
+  ADD, SUB, SUBR, ADDN, ADC, SBB, NEG, ABS,
+  MUL, MULHI, DIV, MOD, RCP,
+  AOS, AOSOA,
+  MADD, MSUB, MSUBR, MADDN,
+  FMADD, FMSUB, FMSUBR, FMADDN,
+  EQ, NEQ, LT, LE, ORD, EQU, NEQU, LTU, LEU, UNORD,
+  JUMP, BRANCH, CALL, RET,
+  BT, BTS, BTR, BTC,
+  CTZ, CLZ, POPCNT, /* other bit ops bmi1/bmi2 */
+  SQRT, RSQRT,
+  SHUFFLE, BROADCAST, EXTRACT, INSERT,
+  MEMSET, MEMCPY,
+};
+
+typedef unsigned char Opcode;
+typedef unsigned int Data;
+
+struct Event {
+  Event() {}
+  Event(Opcode code, Data data) : code(code), data(data) {}
+#ifdef _M_X64
+  Event(Opcode code, size_t data) : code(code), data((Data)data) {
+    assert(this->data == data);
+  }
+#endif
+  Opcode code;
+  Data data;
+};
+
+struct EventRef {
+  EventRef(Opcode& code, Data& data) : code(code), data(data) {}
+  EventRef& operator=(Event Event) {
+    code = Event.code;
+    data = Event.data;
+    return *this;
+  }
+  Opcode& code;
+  Data& data;
+};
+
+struct EventStream {
+  EventRef operator [](size_t index) const { return EventRef(codes[index], data[index]); }
+  Opcode* codes;
+  Data* data;
+};
+
+struct Block {
+  Block* dominator;
+  Block* head;
+  size_t firstEvent;
+  size_t numEvents;
+};
+
+void print(EventStream events, size_t numInstrs);
+
+#if 0
 namespace Jagger {
 
 struct Block;
 struct Instruction;
 struct Use;
-
 
 // EQ_OQ(EQ) 0H Equal(ordered, non - signaling) False False True False No
 // UNORD_Q(UNORD) 3H Unordered(non - signaling) False False False True No
@@ -90,6 +156,7 @@ struct CMPFamily {
 
 struct Opcode {
   enum Code {
+    // KEYED COPY, COPY, FORCED COPY, VALUE, FORCED VALUE, KEYED VALUE, USE
     NOP, PHI, HEADER, TIE, COPY, SOURCE, SINK,
     VALUE, LOAD, STORE, ULOAD, USTORE, GATHER, SCATTER,
     SEXT, ZEXT, FCVT, /* ZEXT/FCVT used for truncation */
@@ -397,3 +464,4 @@ union Event {
 void print(Event* events, size_t numEvents);
 #endif
 } // namespace Jagger
+#endif

@@ -19,29 +19,50 @@
 #include <stdio.h>
 #include <map>
 
-static char OpcodeNames[][16] = {
-  "NOP", "PHI", "HEADER", "TIE", "COPY", "SOURCE", "SINK",
-  "VALUE", "LOAD", "STORE", "ULOAD", "USTORE", "GATHER", "SCATTER",
-  "SEXT", "ZEXT", "FCVT", /* ZEXT/FCVT used for truncation */
-  "AND", "OR", "ANDN", "ORN", "XOR", "XNOR", "NAND", "NOR", "NOT", "TEST",
+static char OpcodeNames[][20] = {
+  "NOP", "USE", "MUTED_USE", "HEADER", "HEADER_DOMINATES",
+  "INT32", "LOAD", "STORE", "ULOAD", "USTORE", "GATHER", "SCATTER",
+  "SEXT", "ZEXT", "FCVT",
+  "AND", "OR", "ANDN", "ORN", "XOR", "XNOR", "NAND", "NOR", "NOT",
   "SLL", "SLR", "SAR", "ROL", "ROR",
   "MIN", "MAX",
   "ADD", "SUB", "SUBR", "ADDN", "ADC", "SBB", "NEG", "ABS",
   "MUL", "MULHI", "DIV", "MOD", "RCP",
-  "AOS", "AOSOA"
+  "AOS", "AOSOA",
   "MADD", "MSUB", "MSUBR", "MADDN",
   "FMADD", "FMSUB", "FMSUBR", "FMADDN",
-  "EQ",  "NEQ",  "LT",  "LE",  "ORD",  "EQU",  "NEQU",  "LTU",  "LEU",  "UNORD",
+  "EQ", "NEQ", "LT", "LE", "ORD", "EQU", "NEQU", "LTU", "LEU", "UNORD",
   "JUMP", "BRANCH", "CALL", "RET",
   "BT", "BTS", "BTR", "BTC",
-  "CTZ", "CLZ", "POPCNT", /* other bit ops bmi1/bmi2 */
+  "CTZ", "CLZ", "POPCNT",
   "SQRT", "RSQRT",
   "SHUFFLE", "BROADCAST", "EXTRACT", "INSERT",
   "MEMSET", "MEMCPY",
 };
 
+void print(EventStream events, size_t numInstrs) {
+  for (size_t i = 0; i < numInstrs; ++i) {
+    auto code = events[i].code;
+    printf("%3d > ", i);
+    if (code <= MEMCPY)
+      printf("%s", OpcodeNames[code]);
+    else {
+      if (code == PHI)
+        printf("PHI");
+      else {
+        if (code & FIXED) printf("FIXED ");
+        if (code & KEY) printf("KEY ");
+        printf("%s-%d", code >= COPY ? "COPY" : "VALUE", code & 0xf);
+      }
+    }
+    printf(" : %d\n", events.data[i]);
+  }
+}
 
+
+#if 0
 namespace Jagger {
+void print(Instrs instrs, size_t numInstrs);
 void Instruction::print(const Instruction* base) {
 #if 0
   std::map<Opcode, const OpcodeInfo*> exmap;
@@ -79,3 +100,4 @@ void print(Instruction* instrs, size_t numInstrs) {
     i->print(instrs);
 }
 }
+#endif

@@ -60,7 +60,7 @@
 #include <vector>
 
 using namespace clang::threadSafety::til;
-using namespace Jagger;
+//using namespace Jagger;
 
 #ifdef _MSC_VER
 extern "C" unsigned char _BitScanForward(unsigned long * Index, unsigned long Mask);
@@ -96,58 +96,59 @@ RangeAdaptor<Type> AdaptRange(Type* begin, Type* end) {
 
 struct LiveRange {
   struct Iterator {
-    Iterator(Instruction* instr) : i(instr), skipUntil(i) {}
-    Instruction& operator*() const { return *i; }
+    Iterator(EventStream events, size_t index)
+        : events(events), index(index), skipUntil(index) {}
+    EventRef operator*() const { return events[index]; }
     Iterator& operator++() {
-      if (i->opcode.code == Opcode::HEADER) {
-        if (i->opcode.flags)
-          skipUntil = i + i->arg1;
-        else if (i <= skipUntil)
-          i = i + i->arg1;
-      }
-      i--;
+      if (events.codes[index] == HEADER_DOMINATES)
+        skipUntil = events.data[index];
+      else if (events.codes[index] == HEADER && index <= skipUntil)
+        index = events.data[index];
+      index--;
       return *this;
     }
-    bool operator!=(const Iterator& a) const { return i != a.i; }
+    bool operator!=(const Iterator& a) const { return index != a.index; }
 
    private:
-    Instruction* i;
-    Instruction* skipUntil;
+     EventStream events;
+    size_t index;
+    size_t skipUntil;
   };
 
-  LiveRange(Instruction* def, Instruction* use) : def(def), use(use) {}
-  Iterator begin() const { return use - 1; }
-  Iterator end() const { return def; }
+  LiveRange(EventStream events, size_t def, size_t use)
+      : events(events), def(def), use(use) {}
+  Iterator begin() const { return Iterator(events, use - 1); }
+  Iterator end() const { return Iterator(EventStream(), def); }
 
  private:
-  Instruction* def;
-  Instruction* use;
+  EventStream events;
+  size_t def;
+  size_t use;
 };
 
 namespace Jagger {
-Instruction countedMarker;
+Opcode countedMarker;
 }  // namespace Jagger
 
 //namespace {
-struct InstructionStream {
+struct RegisterAllocator {
   void encode(SCFG* const* cfg, size_t numCFGs);
 
-  static size_t countInstrs(SExpr* expr);
-  Instruction* emitBlockHeader(Instruction* nextInstr, Block* block);
-  Instruction* emitArgument(Instruction* nextInstr, Phi* phi);
-  Instruction* emitInstrs(Instruction* nextInstr, SExpr* expr);
-  Instruction* emitTerminator(Instruction* nextInstr, Terminator* term, BasicBlock* basicBlock);
-
-  void traverse(Instruction* use, Instruction* def);
+  static size_t countEvents(SExpr* expr);
+  static size_t emitBlockHeader(EventStream events, size_t index, Block* block);
+  static size_t emitArgument   (EventStream events, size_t index, Phi* phi);
+  static size_t emitEvents     (EventStream events, size_t index, SExpr* expr);
+  static size_t emitTerminator (EventStream events, size_t index, Terminator* term, BasicBlock* basicBlock);
 
   Block* blocks;
-  Instruction* instrs;
   size_t numBlocks;
-  size_t numInstrs;
-  std::vector<std::pair<int, int>> interactions;
+  EventStream events;
+  size_t numEvents;
+  std::vector<std::pair<Data, Data>> conflicts;
 };
 //}  // namespace
 
+#if 0
 void InstructionStream::traverse(Instruction* use, Instruction* def) {
   Instruction* skipUntil = use;
   auto defIndex = (int)(def - instrs);
@@ -177,8 +178,9 @@ void InstructionStream::traverse(Instruction* use, Instruction* def) {
   }
 #endif
 }
+#endif
 
-void InstructionStream::encode(SCFG* const* cfgs, size_t numCFGs) {
+void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
   if (!numCFGs) return;
 
   {
@@ -195,103 +197,148 @@ void InstructionStream::encode(SCFG* const* cfgs, size_t numCFGs) {
   {
     // Initialize blocks and count instructions.
     Block* nextBlock = blocks;
-    size_t numInstrs = 0;
+    size_t numEvents = 0;
     for (auto cfg : AdaptRange(cfgs, numCFGs))
       for (auto basicBlock : *cfg) {
-        basicBlock->setBackendID(nextBlock);
-        nextBlock->dominator = nullptr;
-        nextBlock->head = nextBlock;
-        size_t size = 0;
-        if (BasicBlock* parent = basicBlock->parent()) {
-          size++;  // block header
-          nextBlock->dominator = (Block*)parent->getBackendID();
-          if (basicBlock->PostDominates(*parent) ||
-              nextBlock->dominator + 1 == nextBlock)
-            nextBlock->head = nextBlock->dominator->head;
-        }
-        for (auto arg : basicBlock->arguments()) size += countInstrs(arg);
-        for (auto instr : basicBlock->instructions())
-          size += countInstrs(instr);
-        size += countInstrs(basicBlock->terminator());
-        nextBlock->firstInstr = numInstrs;
-        nextBlock->numInstrs = size;
-        numInstrs += size;
-        nextBlock++;
+      basicBlock->setBackendID(nextBlock);
+      nextBlock->dominator = nullptr;
+      nextBlock->head = nextBlock;
+      size_t size = 0;
+      if (BasicBlock* parent = basicBlock->parent()) {
+        size++;  // block header
+        nextBlock->dominator = (Block*)parent->getBackendID();
+        if (basicBlock->PostDominates(*parent) ||
+          nextBlock->dominator + 1 == nextBlock)
+          nextBlock->head = nextBlock->dominator->head;
       }
-    this->numInstrs = numInstrs;
+      for (auto arg : basicBlock->arguments()) size += countEvents(arg);
+      for (auto instr : basicBlock->instructions())
+        size += countEvents(instr);
+      size += countEvents(basicBlock->terminator());
+      nextBlock->firstEvent = numEvents;
+      nextBlock->numEvents = size;
+      numEvents += size;
+      nextBlock++;
+      }
+    this->numEvents = numEvents;
   }
 
-  assert(numInstrs);
-  instrs = new Instruction[numInstrs];
+  assert(numEvents);
+  events.codes = new Opcode[numEvents];
+  events.data = new Data[numEvents];
 
   {
     // Emit instructions.
-    Instruction* nextInstr = instrs;
-    Block* nextBlock = blocks;
+    size_t index = 0;
+    Block* block = blocks;
     for (auto cfg : AdaptRange(cfgs, numCFGs))
       for (auto basicBlock : *cfg) {
-        assert(instrs + nextBlock->firstInstr == nextInstr);
-        nextBlock->instrs = nextInstr;
-        nextInstr = emitBlockHeader(nextInstr, nextBlock);
-        for (auto arg : basicBlock->arguments())
-          nextInstr = emitArgument(nextInstr, cast<Phi>(arg));
-        for (auto instr : basicBlock->instructions())
-          nextInstr = emitInstrs(nextInstr, instr);
-        nextInstr =
-            emitTerminator(nextInstr, basicBlock->terminator(), basicBlock);
-        assert(nextInstr == nextBlock->instrs + nextBlock->numInstrs);
-        nextBlock++;
+      assert(block->firstEvent == index);
+      index = emitBlockHeader(events, index, block);
+      for (auto arg : basicBlock->arguments())
+        index = emitArgument(events, index, cast<Phi>(arg));
+      for (auto instr : basicBlock->instructions())
+        index = emitEvents(events, index, instr);
+      index = emitTerminator(events, index, basicBlock->terminator(),
+        basicBlock);
+      assert(index == block->firstEvent + block->numEvents);
+      block++;
       }
   }
 
-#if 0
-  // Determine last uses.
-  for (auto uses : AdaptRange(instrs, numInstrs)) {
-    auto arg0 = uses.arg0;
-    auto arg1 = uses.arg1;
-    if (arg0 | arg1) {
-      if (arg0 == arg1)
-        uses.opcode.isArg0NotLastUse = true;
-      for (auto instr :
-           LiveRange(std::min(uses.getArg0(), uses.getArg1()), &uses)) {
-        if (instr.arg0 == arg0 || instr.arg0 == arg1)
-          instr.opcode.isArg0NotLastUse = true;
-        if (instr.arg1 == arg0 || instr.arg1 == arg1)
-          instr.opcode.isArg1NotLastUse = true;
-      }
+  // Verify integrety of copies
+  for (size_t i = 0; i < numEvents; ++i) {
+    if (events[i].code == USE) {
+      size_t def = events[i].data;
+      assert(events[def].code & VALUE);
+      assert(events[def].code & FIXED || events[def].data == def);
+    }
+    if (events[i].code >= COPY)
+      assert(events[i - 1].code == USE);
+  }
+
+  // Link copies.
+  for (size_t i = 0; i < numEvents; ++i) {
+    if (events[i].code >= COPY) {
+      size_t def = events[i - 1].data;
+      // max is deterministic in parallel.
+      if (!(events[def].code & FIXED))
+        events[def].data = std::max(events[def].data, i);
     }
   }
-#endif
 
-#if 0
-  // Link phis
-  for (auto uses : AdaptRange(instrs, numInstrs)) {
-    if (uses.opcode.code == Opcode::COPY) uses.key = uses.arg0;
-    if (uses.opcode == Opcodes::phi) {
-      // TODO, FIX ME: could be coming from many places
-      auto key = i;
-      uses.getArg0()->updateKey(i);
-      uses.getArg1()->updateKey(i);
+  // Traverse the keys.
+  for (size_t i = 0; i < numEvents; ++i) {
+    // TOOD: fuse these tests
+    if (events[i].code & VALUE && !(events[i].code & FIXED)) {
+      size_t key = i;
+      do {
+        key = events[key].data;
+        assert(events[key].code & VALUE);
+      } while (!(events[key].code & FIXED) && events[key].data != key);
+      events[i].data = (Data)key;
+    }
+  }
+
+  // Determine last uses.
+  for (size_t i = 0; i < numEvents; ++i) {
+    if (events[i].code != USE) continue;
+    size_t def = events[i].data;
+    if (events[def].code & FIXED) {
+      events[i].code = MUTED_USE;
       continue;
     }
-  }
-#endif
-
-#if 0
-  // Update links
-  for (auto instr : AdaptRange(instrs, numInstrs)) {
-    if (instr.opcode.code == Opcode::COPY) {
-      if (!instr.opcode.isArg0NotLastUse)
-        ;
+    for (auto event : LiveRange(events, def, i)) {
+      if (event.code == USE && event.data == def) {
+        event.code = MUTED_USE;
+        // TODO: terminate here if we can.
+      }
     }
-    else if (instr.opcode.isDestructive && instr.arg0&& instr.getKey() == instr.getArg0().
   }
 
-  // Finalize the keys.
-  for (auto instr : AdaptRange(instrs, numInstrs)) {
-    i.updateKey();
-#endif
-  
+  // Unlink conflicting copies and mark conflicts.
+  for (size_t i = 0; i < numEvents; ++i) {
+    if (events[i].code != USE) continue;
+    size_t def = events[i].data;
+    size_t key = events[def].data;
+    for (auto event : LiveRange(events, def, i))
+      if (event.code & VALUE) {
+        if (!(event.code & FIXED) && event.data == key)
+          event.data = &event.code - events.codes;
+        size_t other = event.data;
+        conflicts.push_back(
+            std::make_pair(std::min(key, other), std::max(key, other)));
+      }
+  }
+
+  // Find the keys.
+  std::vector<Data> keys;
+  std::vector<Data> fixed;
+  for (size_t i = 0; i < numEvents; ++i) {
+    if (!(events[i].code & VALUE)) continue;
+    if (events[i].code & FIXED)
+      fixed.push_back(i);
+    else if (events[i].data == i) {
+      events[i].code |= KEY;
+      events[i].data = 0;
+      keys.push_back(i);
+    }
+  }
+  for (auto i : fixed) printf("fixed : %3d [%d]\n", i, events[i].data);
+  for (auto i : keys) printf("key : %3d\n", i);
+
+  std::sort(conflicts.begin(), conflicts.end());
+  std::vector<std::pair<Data, Data>> uniqued;
+  uniqued.push_back(*conflicts.begin());
+  for (auto i = conflicts.begin() + 1, e = conflicts.end(); i != e; ++i)
+    if (*i != i[-1]) uniqued.push_back(*i);
+  for (auto i : uniqued) printf("> %d, %d\n", i.first, i.second);
+
+  for (auto i : uniqued) {
+    events[i.first].data++;
+    events[i.second].data++;
+  }
+
 #if 0
   for (Instruction* i = instrs, *e = instrs + numInstrs; i != e; ++i) {
     if (i->opcode == &globalOpcodes.phi)
@@ -395,50 +442,38 @@ void InstructionStream::encode(SCFG* const* cfgs, size_t numCFGs) {
 #endif
 }
 
-size_t InstructionStream::countInstrs(SExpr* expr) {
+Opcode countedMarker;
+
+size_t RegisterAllocator::countEvents(SExpr* expr) {
   if (expr->getBackendID()) return 0;
   expr->setBackendID(&countedMarker);
   switch (expr->opcode()) {
     case COP_Literal:
-      return 1;
+      return 2;
     case COP_Variable:
-      return countInstrs(cast<Variable>(expr)->definition());
+      return countEvents(cast<Variable>(expr)->definition());
     case COP_BinaryOp: {
-      int size = 0;
+      int size = countEvents(cast<BinaryOp>(expr)->expr0()) +
+                 countEvents(cast<BinaryOp>(expr)->expr1());
       switch (cast<BinaryOp>(expr)->binaryOpcode()) {
-        case BOP_Add:
-          size = 3;
-          break;
-        case BOP_Sub:
-          size = 4;
-          break;
-        case BOP_Mul:
-          size = 5;
-          break;
-        case BOP_Eq:
-          size = 1;
-          break;
-        case BOP_Lt:
-          size = 1;
-          break;
-        case BOP_Leq:
-          size = 1;
-          break;
+      case BOP_Add: return size + 6;
+      case BOP_Sub: return size + 7;
+      case BOP_Mul: return size + 10;
+      case BOP_Eq: return size + 4;
+      case BOP_Lt: return size + 4;
+      case BOP_Leq: return size + 4;
       }
-      return countInstrs(cast<BinaryOp>(expr)->expr0()) +
-             countInstrs(cast<BinaryOp>(expr)->expr1()) + size;
+      assert(false);
+      return 0;
     }
     case COP_Phi:
-      // Because phi instructions are binary we need n-1 of them to make a tree
-      // of phi/tie instructions with n leaves.
-      assert(cast<Phi>(expr)->values().size() == 2);
-      return cast<Phi>(expr)->values().size() - 1;
+      return 1;
     case COP_Goto:
-      return cast<Goto>(expr)->targetBlock()->arguments().size() + 1;
+      return cast<Goto>(expr)->targetBlock()->arguments().size() * 2 + 1;
     case COP_Branch:
-      return countInstrs(cast<Branch>(expr)->condition()) + 1;
+      return countEvents(cast<Branch>(expr)->condition()) + 2;
     case COP_Return:
-      return countInstrs(cast<Return>(expr)->returnValue()) + 2;
+      return countEvents(cast<Return>(expr)->returnValue()) + 3;
     default:
       printf("unknown opcode: %d\n", expr->opcode());
       assert(false);
@@ -446,45 +481,39 @@ size_t InstructionStream::countInstrs(SExpr* expr) {
   }
 }
 
-Instruction* InstructionStream::emitBlockHeader(Instruction* nextInstr,
-                                                Block* block) {
-  if (!block->dominator) return nextInstr;
+size_t RegisterAllocator::emitBlockHeader(EventStream events, size_t index,
+                                          Block* block) {
+  if (!block->dominator) return index;
   if (block->head != block)
-    nextInstr->init(Opcode(Opcode::HEADER, Opcode::AliasSet::NONE), block->head->instrs);
+    events[index++] = Event(HEADER_DOMINATES, block->head->firstEvent);
   else
-    nextInstr->init(Opcode(Opcode::HEADER, Opcode::AliasSet::NONE, Opcode::Flags::DOMINATING_HEADER),
-                    block->dominator->instrs + block->dominator->numInstrs);
-  return ++nextInstr;
+    events[index++] = Event(
+        HEADER, block->dominator->firstEvent + block->dominator->numEvents);
+  return index;
 }
 
-Instruction* InstructionStream::emitArgument(Instruction* nextInstr, Phi* phi) {
-  // Because phi instructions are binary we need n-1 of them to make a tree
-  // of phi/tie instructions with n leaves.
-  if (phi->values().size() == 1) {
-    // TODO: eliminate this case in the middle-end
-    phi->setBackendID(phi->values()[0]->getBackendID());
-    return nextInstr;
-  }
-  assert(phi->values().size() == 2);
-  nextInstr->init(Opcode(Opcode::PHI, Opcode::AliasSet::GENERAL),
-    (Instruction*)phi->values()[0]->getBackendID(),
-    (Instruction*)phi->values()[1]->getBackendID());
-  phi->setBackendID(nextInstr);
-  return ++nextInstr;
+size_t RegisterAllocator::emitArgument(EventStream events, size_t index, Phi* phi) {
+  size_t result = index;
+  events[index++] = Event(PHI, result);
+  phi->setBackendID(&events[result].code);
+  return index;
 }
 
-Instruction* InstructionStream::emitInstrs(Instruction* nextInstr,
-                                           SExpr* expr) {
-  if (expr->getBackendID() != &countedMarker) return nextInstr;
-  Instruction* result = nullptr;
+static size_t getBackendID(EventStream events, SExpr* expr) {
+  return (size_t)((Opcode*)expr->getBackendID() - events.codes);
+}
+
+size_t RegisterAllocator::emitEvents(EventStream events, size_t index, SExpr* expr) {
+  if (expr->getBackendID() != &countedMarker) return index;
+  size_t result = 0;
   switch (expr->opcode()) {
     case COP_Literal: {
       Literal* literal = cast<Literal>(expr);
       switch (literal->valueType().Base) {
         case ValueType::BT_Int:
-          result = nextInstr++->init(
-              Opcode(Opcode::VALUE, Opcode::AliasSet::GENERAL),
-              (Instruction*)literal->as<int>().value());
+          result = index;
+          events[index++] = Event(VALUE | ALIAS_GENERAL, result);
+          events[index++] = Event(INT32, (Data)literal->as<int>().value());
           break;
         default:
           assert(false);
@@ -493,71 +522,78 @@ Instruction* InstructionStream::emitInstrs(Instruction* nextInstr,
     }
     case COP_Variable: {
       auto definition = cast<Variable>(expr)->definition();
-      nextInstr = emitInstrs(nextInstr, definition);
-      result = (Instruction*)definition->getBackendID();
+      index = emitEvents(events, index, definition);
+      result = (Opcode*)definition->getBackendID() - events.codes;
       break;
     }
     case COP_BinaryOp: {
       auto binaryOp = cast<BinaryOp>(expr);
-      nextInstr = emitInstrs(nextInstr, binaryOp->expr0());
-      nextInstr = emitInstrs(nextInstr, binaryOp->expr1());
+      index = emitEvents(events, index, binaryOp->expr0());
+      index = emitEvents(events, index, binaryOp->expr1());
       printf("?? %d : %d %d\n", binaryOp->binaryOpcode(),
-        (Instruction*)binaryOp->expr0()->opcode(),
-        (Instruction*)binaryOp->expr1()->opcode());
-      auto arg0 = (Instruction*)binaryOp->expr0()->getBackendID();
-      auto arg1 = (Instruction*)binaryOp->expr1()->getBackendID();
+             binaryOp->expr0()->opcode(),
+             binaryOp->expr1()->opcode());
+      auto arg0 = getBackendID(events, binaryOp->expr0());
+      auto arg1 = getBackendID(events, binaryOp->expr1());
       switch (binaryOp->binaryOpcode()) {
         case BOP_Add:
           // TODO: add cases for types
           // TODO: sort out the lea/add issue
-          arg0 = nextInstr++->init(
-            Opcode(Opcode::COPY, Opcode::AliasSet::GENERAL), arg0);
-          result = nextInstr++->init(
-              Opcode(Opcode::ADD, Opcode::AliasSet::GENERAL), arg0, arg1);
-          nextInstr++->init(Opcode(Opcode::SOURCE, Opcode::AliasSet::FLAGS));
+          result = index + 3;
+          events[index++] = Event(USE, arg0);
+          events[index++] = Event(COPY | ALIAS_GENERAL, result);
+          events[index++] = Event(USE, arg1);
+          events[index++] = Event(VALUE | ALIAS_GENERAL, result);
+          events[index++] = Event(VALUE | ALIAS_FLAGS, result + 1);
+          events[index++] = Event(ADD, 0);
           break;
         case BOP_Sub:
           // TODO: add cases for types
-          arg0 = nextInstr++->init(
-              Opcode(Opcode::COPY, Opcode::AliasSet::GENERAL), arg0);
-          arg1 =
-              nextInstr++->init(Opcode(Opcode::COPY, Opcode::AliasSet::GENERAL,
-                                       Opcode::Flags::CONFLICT_PROXY),
-                                arg1);
-          result = nextInstr++->init(
-              Opcode(Opcode::ADD, Opcode::AliasSet::GENERAL), arg0, arg1);
-          nextInstr++->init(Opcode(Opcode::SOURCE, Opcode::AliasSet::FLAGS));
+          result = index + 2;
+          events[index++] = Event(USE, arg0);
+          events[index++] = Event(COPY | ALIAS_GENERAL, result - 1);
+          events[index++] = Event(VALUE | ALIAS_GENERAL, result);
+          events[index++] = Event(USE, arg1);
+          events[index++] = Event(COPY | ALIAS_GENERAL, arg1);
+          events[index++] = Event(VALUE | ALIAS_FLAGS, result + 3);
+          events[index++] = Event(ADD, 0);
           break;
         case BOP_Mul:
-          arg0 =
-              nextInstr++->init(Opcode(Opcode::COPY, Opcode::AliasSet::GENERAL,
-                                       Opcode::Flags::NO_FLAGS, 1),
-                                arg0);
-          arg1 =
-              nextInstr++->init(Opcode(Opcode::COPY, Opcode::AliasSet::GENERAL,
-                                       Opcode::Flags::NO_FLAGS, 2),
-                                arg1);
-          result =
-              nextInstr++->init(Opcode(Opcode::MUL, Opcode::AliasSet::GENERAL,
-                                       Opcode::Flags::NO_FLAGS, 1),
-                                arg0, arg1);
-          nextInstr++->init(Opcode(Opcode::SOURCE, Opcode::AliasSet::GENERAL,
-                                   Opcode::Flags::NO_FLAGS, 2));
-          nextInstr++->init(Opcode(Opcode::SOURCE, Opcode::AliasSet::FLAGS));
+          result = index + 7;
+          events[index++] = Event(USE, arg0);
+          events[index++] = Event(COPY | FIXED | ALIAS_GENERAL, 0);
+          events[index++] = Event(USE, arg1);
+          events[index++] = Event(COPY | FIXED | ALIAS_GENERAL, 1);
+          events[index++] = Event(VALUE | FIXED | ALIAS_GENERAL, 0);
+          events[index++] = Event(VALUE | FIXED | ALIAS_GENERAL, 1);
+          events[index++] = Event(USE, result - 3);
+          events[index++] = Event(COPY | ALIAS_GENERAL, result);
+          events[index++] = Event(VALUE | ALIAS_FLAGS, result + 1);
+          events[index++] = Event(MUL, 0);
           break;
-      case BOP_Eq:
-        result = nextInstr++->init(Opcode(Opcode::EQ, Opcode::AliasSet::FLAGS),
-                                   arg0, arg1);
-        break;
-      case BOP_Lt:
-        result = nextInstr++->init(Opcode(Opcode::LT, Opcode::AliasSet::FLAGS),
-          arg0, arg1);
-        break;
-      case BOP_Leq:
-        result = nextInstr++->init(Opcode(Opcode::LE, Opcode::AliasSet::FLAGS),
-          arg0, arg1);
-        break;
-      default: assert(false);
+        case BOP_Eq:
+          result = index + 2;
+          events[index++] = Event(USE, arg0);
+          events[index++] = Event(USE, arg1);
+          events[index++] = Event(VALUE | ALIAS_FLAGS, result);
+          events[index++] = Event(EQ, 0);
+          break;
+        case BOP_Lt:
+          result = index + 2;
+          events[index++] = Event(USE, arg0);
+          events[index++] = Event(USE, arg1);
+          events[index++] = Event(VALUE | ALIAS_FLAGS, result);
+          events[index++] = Event(LT, 0);
+          break;
+        case BOP_Leq:
+          result = index + 2;
+          events[index++] = Event(USE, arg0);
+          events[index++] = Event(USE, arg1);
+          events[index++] = Event(VALUE | ALIAS_FLAGS, result);
+          events[index++] = Event(LE, 0);
+          break;
+        default:
+          assert(false);
       }
       break;
     }
@@ -566,8 +602,8 @@ Instruction* InstructionStream::emitInstrs(Instruction* nextInstr,
       assert(false);
       return 0;
   }
-  expr->setBackendID(result);
-  return nextInstr;
+  expr->setBackendID(&events[result].code);
+  return index;
 }
 
 // the index for this block in the target's phis
@@ -575,15 +611,14 @@ Instruction* InstructionStream::emitInstrs(Instruction* nextInstr,
 static size_t getPhiIndex(BasicBlock* basicBlock, BasicBlock* targetBlock) {
   auto& predecessors = targetBlock->predecessors();
   for (size_t i = 0, e = predecessors.size(); i != e; ++i)
-    if (predecessors[i] == basicBlock)
-      return i;
+    if (predecessors[i] == basicBlock) return i;
   return 0;
 }
 
-Instruction* InstructionStream::emitTerminator(Instruction* nextInstr,
-                                               Terminator* term,
-                                               BasicBlock* basicBlock) {
-  Instruction* result = nullptr;
+size_t RegisterAllocator::emitTerminator(EventStream events,
+                                         size_t index, Terminator* term,
+                                         BasicBlock* basicBlock) {
+  size_t result = 0;
   switch (term->opcode()) {
     case COP_Goto: {
       auto jump = cast<Goto>(term);
@@ -592,54 +627,42 @@ Instruction* InstructionStream::emitTerminator(Instruction* nextInstr,
       auto& arguments = targetBasicBlock->arguments();
 
       auto numArguments = (int)arguments.size();
-      auto block = (Block*)basicBlock->getBackendID();
+      //auto block = (Block*)basicBlock->getBackendID();
       auto targetBlock = (Block*)targetBasicBlock->getBackendID();
-      auto phiCopyDelta =
-          block->firstInstr + block->numInstrs - (targetBlock->firstInstr + 1);
+      auto targetPhiIndex = targetBlock->firstEvent + 1;
 
       // This loop should emit nothing! TODO: validate and remove
-      //for (auto arg : arguments)
-      //  nextInstr = emitInstrs(nextInstr, cast<Phi>(arg)->values()[phiIndex]);
+      // for (auto arg : arguments)
+      //  nextEvent = emitEvents(nextEvent, cast<Phi>(arg)->values()[phiIndex]);
       for (auto arg : arguments) {
-        auto instr =
-            (Instruction*)cast<Phi>(arg)->values()[phiIndex]->getBackendID();
-        nextInstr++->init(Opcode(Opcode::COPY, Opcode::AliasSet::GENERAL,
-                                 Opcode::Flags::PHI_PROXY),
-                          instr, nextInstr, nextInstr + phiCopyDelta);
+        size_t arg0 = getBackendID(events, cast<Phi>(arg)->values()[phiIndex]);
+        events[index++] = Event(USE, arg0);
+        events[index++] = Event(COPY | ALIAS_GENERAL, targetPhiIndex++);
       }
-      result = nextInstr++->init(Opcode(Opcode::JUMP, Opcode::AliasSet::NONE));
+      events[result = index++] = Event(JUMP, 0);
       break;
     }
     case COP_Branch: {
       auto branch = cast<Branch>(term);
       auto condition = branch->condition();
-      nextInstr = emitInstrs(nextInstr, condition);
-      nextInstr++->init(Opcode(Opcode::BRANCH, Opcode::AliasSet::NONE),
-                      (Instruction*)condition->getBackendID());
+      index = emitEvents(events, index, condition);
+      events[index++] = Event(USE, (Opcode*)condition->getBackendID() - events.codes);
+      events[result = index++] = Event(BRANCH, 0);
       break;
     }
     case COP_Return: {
       auto ret = cast<Return>(term);
       auto value = ret->returnValue();
-      nextInstr = emitInstrs(nextInstr, value);
-      nextInstr++->init(Opcode(Opcode::SINK, Opcode::AliasSet::GENERAL,
-                               Opcode::Flags::NO_FLAGS, 1),
-                        (Instruction*)value->getBackendID());
-      nextInstr++->init(Opcode(Opcode::RET, Opcode::AliasSet::NONE));
+      index = emitEvents(events, index, value);
+      events[index++] = Event(USE, (Opcode*)value->getBackendID() - events.codes);
+      events[index++] = Event(COPY | FIXED | ALIAS_GENERAL, 0);
+      events[result = index++] = Event(RET, 0);
       break;
     }
   }
-  term->setBackendID(result);
-  return nextInstr;
+  term->setBackendID(&events[result].code);
+  return index;
 }
-
-
-
-
-
-
-
-
 
 #if 0
 
@@ -1137,10 +1160,10 @@ void InstructionStream::printWalks() {
 #endif
 
 void encode(SCFG* cfg, char* output) {
-  InstructionStream stream;
-  stream.encode(&cfg, 1);
+  RegisterAllocator allocator;
+  allocator.encode(&cfg, 1);
 
-  print(stream.instrs, stream.numInstrs);
+  print(allocator.events, allocator.numEvents);
   //stream.printWalks();
   //X64Builder builder;
   //emitASM(builder, InstructionStream.events.data(), InstructionStream.events.size());
