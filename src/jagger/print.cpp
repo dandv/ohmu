@@ -47,15 +47,12 @@ void print(EventStream events, size_t numInstrs) {
     if (code <= MEMCPY)
       printf("%s", OpcodeNames[code]);
     else {
-      if (code == PHI)
-        printf("PHI");
-      else {
-        if (code & FIXED) printf("FIXED ");
-        if (code & KEY) printf("KEY ");
-        printf("%s-%d", code >= COPY ? "COPY" : "VALUE", code & 0xf);
-      }
+      if ((code & VALUE_MASK) == VALUE) printf("VALUE");
+      if ((code & VALUE_MASK) == PHI) printf("PHI");
+      if ((code & VALUE_MASK) == COPY) printf("COPY");
+      if ((code & VALUE_MASK) == PHI_COPY) printf("PHI_COPY");
     }
-    printf(" : %d\n", events.data[i]);
+    printf(" : %d\n", events[i].data);
   }
 }
 

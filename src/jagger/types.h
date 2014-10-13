@@ -21,8 +21,13 @@
 
 
 enum {
-  VALUE = 0x80, COPY = 0xc0, FIXED = 0x20, KEY = 0x10, PHI = 0x8f,
-  ALIAS_FLAGS = VALUE, ALIAS_GENERAL, ALIAS_SSE,
+  VALUE = 0x80, PHI = 0x90, COPY = 0xa0, PHI_COPY = 0xb0,
+  FLAGS_REGS = 0x01, GP_REGS = 0x02, SSE_REGS = 0x03, X87_REGS = 0x04,
+  IS_FIXED = 0x40, USE_FIXED = VALUE | IS_FIXED,
+  VALUE_MASK = 0xf0, REGS_MASK = 0x07,
+  USE_EFLAGS = USE_FIXED | FLAGS_REGS,
+  USE_EAX = USE_FIXED | GP_REGS,
+  USE_EDX = USE_FIXED | GP_REGS | (1 << 3),
   NOP = 0, USE, MUTED_USE, HEADER, HEADER_DOMINATES,
   INT32, LOAD, STORE, ULOAD, USTORE, GATHER, SCATTER,
   SEXT, ZEXT, FCVT, /* ZEXT/FCVT used for truncation */
@@ -59,7 +64,8 @@ struct Event {
 };
 
 struct EventRef {
-  EventRef(Opcode& code, Data& data) : code(code), data(data) {}
+  EventRef(Opcode& code, Data& data, size_t index)
+    : code(code), data(data) {}//, index(index) {}
   EventRef& operator=(Event Event) {
     code = Event.code;
     data = Event.data;
@@ -67,10 +73,16 @@ struct EventRef {
   }
   Opcode& code;
   Data& data;
+  //size_t index;
+  //EventRef prior() const {
+  //  return EventRef((&code)[-1], (&data)[-1], index - 1);
+  //}
 };
 
 struct EventStream {
-  EventRef operator [](size_t index) const { return EventRef(codes[index], data[index]); }
+  EventRef operator[](size_t index) const {
+    return EventRef(codes[index], data[index], index);
+  }
   Opcode* codes;
   Data* data;
 };
@@ -80,6 +92,19 @@ struct Block {
   Block* head;
   size_t firstEvent;
   size_t numEvents;
+};
+
+struct Work {
+  explicit Work(Data index) : index(index) {}
+  bool operator <(const Work& a) const { return count < a.count; }
+  Data count;
+  Data index;
+};
+
+struct Sidecar {
+  Sidecar() : preferred(0), invalid(0) {}
+  Data preferred;
+  Data invalid;
 };
 
 void print(EventStream events, size_t numInstrs);

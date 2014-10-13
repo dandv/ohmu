@@ -144,7 +144,6 @@ struct RegisterAllocator {
   size_t numBlocks;
   EventStream events;
   size_t numEvents;
-  std::vector<std::pair<Data, Data>> conflicts;
 };
 //}  // namespace
 
@@ -203,9 +202,8 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
       basicBlock->setBackendID(nextBlock);
       nextBlock->dominator = nullptr;
       nextBlock->head = nextBlock;
-      size_t size = 0;
+      size_t size = 1;
       if (BasicBlock* parent = basicBlock->parent()) {
-        size++;  // block header
         nextBlock->dominator = (Block*)parent->getBackendID();
         if (basicBlock->PostDominates(*parent) ||
           nextBlock->dominator + 1 == nextBlock)
@@ -246,70 +244,245 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
       }
   }
 
-  // Verify integrety of copies
-  for (size_t i = 0; i < numEvents; ++i) {
-    if (events[i].code == USE) {
-      size_t def = events[i].data;
-      assert(events[def].code & VALUE);
-      assert(events[def].code & FIXED || events[def].data == def);
-    }
-    if (events[i].code >= COPY)
+  // Verify integrety
+  for (size_t i = 0; i < numEvents; i++) {
+    auto event = events[i];
+    if (event.code == USE) {
+      auto target = events[event.data];
+      //printf("%d %d\n", event.data, target.data);
+      assert(target.data == event.data);
+      //printf("%02x\n", target.code);
+      assert((target.code & VALUE_MASK) == VALUE ||
+             (target.code & VALUE_MASK) == COPY ||
+             (target.code & VALUE_MASK) == PHI);
+    } else if ((event.code & VALUE_MASK) == COPY) {
       assert(events[i - 1].code == USE);
-  }
-
-  // Link copies.
-  for (size_t i = 0; i < numEvents; ++i) {
-    if (events[i].code >= COPY) {
-      size_t def = events[i - 1].data;
-      // max is deterministic in parallel.
-      if (!(events[def].code & FIXED))
-        events[def].data = std::max(events[def].data, i);
+    } else if (event.code == PHI_COPY) {
+      assert(events[event.data].code == PHI);
     }
-  }
-
-  // Traverse the keys.
-  for (size_t i = 0; i < numEvents; ++i) {
-    // TOOD: fuse these tests
-    if (events[i].code & VALUE && !(events[i].code & FIXED)) {
-      size_t key = i;
-      do {
-        key = events[key].data;
-        assert(events[key].code & VALUE);
-      } while (!(events[key].code & FIXED) && events[key].data != key);
-      events[i].data = (Data)key;
-    }
+    if (event.code >= VALUE) assert(event.code & REGS_MASK);
   }
 
   // Determine last uses.
-  for (size_t i = 0; i < numEvents; ++i) {
+  for (size_t i = 0; i < numEvents; i++) {
     if (events[i].code != USE) continue;
-    size_t def = events[i].data;
-    if (events[def].code & FIXED) {
-      events[i].code = MUTED_USE;
-      continue;
-    }
-    for (auto event : LiveRange(events, def, i)) {
-      if (event.code == USE && event.data == def) {
-        event.code = MUTED_USE;
+    size_t target = events[i].data;
+    for (auto other : LiveRange(events, target, i)) {
+      if (other.code == USE && other.data == target) {
+        other.code = MUTED_USE;
         // TODO: terminate here if we can.
       }
     }
   }
 
-  // Unlink conflicting copies and mark conflicts.
-  for (size_t i = 0; i < numEvents; ++i) {
-    if (events[i].code != USE) continue;
-    size_t def = events[i].data;
-    size_t key = events[def].data;
-    for (auto event : LiveRange(events, def, i))
-      if (event.code & VALUE) {
-        if (!(event.code & FIXED) && event.data == key)
-          event.data = &event.code - events.codes;
-        size_t other = event.data;
-        conflicts.push_back(
-            std::make_pair(std::min(key, other), std::max(key, other)));
-      }
+  // Link copies.
+  for (size_t i = 0; i < numEvents; i++) {
+    auto event = events[i];
+    if ((event.code & VALUE_MASK) == COPY) {
+      auto use = events[i - 1];
+      if (use.code == MUTED_USE) continue;
+      event.data = use.data;
+      use.code = MUTED_USE;
+      event.code = NOP; // TODO: should we do this?
+    }
+    else if ((event.code & VALUE_MASK) == PHI_COPY) {
+      auto use = events[i - 1];
+      if (use.code == MUTED_USE) continue;
+      auto phi = events[event.data];
+      if (phi.data == event.data || phi.data > use.data) phi.data = use.data;
+    }
   }
+
+  // Traverse the keys.
+  for (size_t i = 0; i < numEvents; i++) {
+    auto event = events[i];
+    //if (event.code < VALUE) continue;
+    if (event.code < VALUE)
+      continue;
+    size_t key = i;
+    do {
+      key = events[key].data;
+    } while (events[key].data != key);
+    events[i].data = (Data)key;
+  }
+  for (size_t i = 0; i < numEvents; i++) {
+    auto event = events[i];
+    if (event.code != USE && event.code != MUTED_USE) continue;
+    // Note: this is a bit tricky...
+    if ((events[event.data].code & VALUE_MASK) == PHI) continue;
+    events[i].data = events[events[i].data].data;
+  }
+
+  // Mark conflicts.
+  std::vector<std::pair<Data, Data>> conflicts;
+  std::vector<std::pair<Data, Data>> fixed_conflicts; //< can be elimintated, I think
+  for (size_t i = 0; i < numEvents; i++) {
+    if (events[i].code != USE) continue;
+    size_t j = events[i].data;
+    auto key = events[events[j].data].data; //< one more level of indirection because of phis
+    for (auto other : LiveRange(events, j, i)) {
+      if (other.code < VALUE) continue;
+      if (other.code & IS_FIXED) {
+        if ((events[j].code & 0x7) != (other.code & 0x7)) continue;
+        fixed_conflicts.push_back(
+            std::make_pair(key, 1 << ((other.code >> 3) & 0x7)));
+      } else {
+        assert(other.data != key);
+        auto other_key = other.data;
+        conflicts.push_back(
+            std::make_pair(std::min(key, other_key), std::max(key, other_key)));
+        //printf("conflict: %d : %d\n", key, other_key);
+      }
+    }
+  }
+
+  // Clean conflicts? (otherwise they confuse the goal marker)
+  for (size_t i = 0; i < numEvents; i++)
+    if (events[i].code >= USE_FIXED && events[i].data == i)
+      events[i].code = NOP;
+
+  // Mark goals.
+  std::vector<std::pair<Data, Data>> goals;
+  for (size_t i = 0; i < numEvents; i++) {
+    auto event = events[i];
+    if ((event.code & VALUE_MASK) != PHI_COPY) continue;
+    auto use = events[i - 1];
+    if (use.code == MUTED_USE) continue;
+    if (event.data == use.data) continue;
+    goals.push_back(std::make_pair(std::min(event.data, use.data),
+                                   std::max(event.data, use.data)));
+  }
+
+  std::sort(conflicts.begin(), conflicts.end());
+  if (conflicts.size() > 1) {
+    size_t j = 1;
+    for (size_t i = 1, e = conflicts.size(); i != e; ++i)
+      if (conflicts[i - 1] != conflicts[i]) conflicts[j++] = conflicts[i];
+    conflicts.resize(j);
+  }
+
+  std::sort(goals.begin(), goals.end());
+  if (goals.size() > 1) {
+    size_t j = 1;
+    for (size_t i = 1, e = goals.size(); i != e; ++i)
+      if (goals[i - 1] != goals[i]) goals[j++] = goals[i];
+    goals.resize(j);
+  }
+
+  //for (auto i : goals)
+  //  printf("- %d %d\n", i.first, i.second);
+  //for (auto i : conflicts)
+  //  printf("X %d %d\n", i.first, i.second);
+  //for (auto i : fixed_conflicts)
+  //  printf("* %d %d\n", i.first, i.second);
+  //return;
+
+  std::vector<Work> work;
+  std::vector<Sidecar> sidecar;
+  for (size_t i = 0; i < numEvents; i++) {
+    auto event = events[i];
+    if ((event.code & (VALUE | IS_FIXED)) != VALUE || event.data != i) continue;
+    event.data = 0;
+    work.push_back(Work(i));
+    sidecar.push_back(Sidecar());
+  }
+
+  for (auto i : conflicts) {
+    events[i.first].data++;
+    events[i.second].data++;
+  }
+
+  for (auto& i : work)
+    i.count = events[i.index].data;
+  std::stable_sort(work.begin(), work.end());
+  for (size_t i = 0, e = work.size(); i != e; ++i)
+    events[work[i].index].data = i;
+
+  for (auto& i : conflicts) {
+    auto a = i.first;
+    auto b = i.second;
+    i.first = events[i.first].data;
+    i.second = events[i.second].data;
+    if (i.first == 49 || i.second == 49)
+      printf(">>$? %d->%d, %d->%d\n", a, i.first, b, i.second);
+    if (i.first > i.second)
+      std::swap(i.first, i.second);
+  }
+  std::sort(conflicts.begin(), conflicts.end());
+
+  for (auto& i : goals) {
+    i.first = events[i.first].data;
+    i.second = events[i.second].data;
+    if (i.first > i.second)
+      std::swap(i.first, i.second);
+  }
+  std::sort(goals.begin(), goals.end());
+
+  for (auto i : goals)
+    printf("- %d %d\n", i.first, i.second);
+  for (auto i : conflicts)
+    printf("X %d %d\n", i.first, i.second);
+  //for (auto i : fixed_conflicts)
+  //  printf("* %d %d\n", i.first, i.second);
+
+  // Mark invalid.
+  for (auto i : fixed_conflicts)
+    sidecar[events[i.first].data].invalid |= i.second;
+
+  // Mark preferred.
+  for (size_t i = 0; i < numEvents; i++) {
+    auto event = events[i];
+    if (event.code < USE_FIXED) continue;
+    sidecar[events[event.data].data].preferred |= 1 << ((event.code >> 3) & 7);
+  }
+
+  printf("work.size = %d\n", work.size());
+  for (size_t i = 0, e = work.size(); i != e; ++i) {
+    printf("%3d %x : %02x %02x\n", work[i].index, work[i].count,
+      sidecar[i].invalid, sidecar[i].preferred);
+  }
+  printf("\n");
+
+  for (size_t i = 0, c = 0, g = 0, e = work.size(), c_end = conflicts.size(),
+              g_end = goals.size();
+       i != e; ++i) {
+    auto preferred = sidecar[i].preferred;
+    auto invalid = sidecar[i].invalid;
+    for (size_t j = g; j < g_end && goals[j].first == i; j++)
+      preferred |= sidecar[goals[j].second].preferred;
+    auto x = preferred & ~invalid;
+    if (!x) x = ~invalid;
+    x = x & -x;
+    work[i].count = x;
+    events[work[i].index].data = x;
+    for (; g < g_end && goals[g].first == i; g++)
+      sidecar[goals[g].second].preferred |= x;
+    for (; c < c_end && conflicts[c].first == i; c++) {
+      printf(">>? %d\n", conflicts[c].second);
+      sidecar[conflicts[c].second].invalid |= x;
+    }
+  }
+
+  printf("work.size = %d\n", work.size());
+  for (size_t i = 0, e = work.size(); i != e; ++i) {
+    printf("%3d %x : %02x %02x\n", work[i].index, work[i].count,
+      sidecar[i].invalid, sidecar[i].preferred);
+  }
+  printf("\n");
+
+#if 0
+  for (auto i : joins) printf("x %d, %d\n", i.first, i.second);
+  printf("----\n");
+  for (auto& i : joins) {
+    auto& event0 = events[i.first];
+    auto& event1 = events[i.second];
+    if (!(event0.code & FIXED)) i.first = event0.data;
+    if (!(event1.code & FIXED)) i.second = event1.data;
+    if (i.first > i.second)
+      std::swap(i.first, i.second);
+  }
+  std::sort(joins.begin(), joins.end());
+  for (auto i : joins) printf("x %d, %d\n", i.first, i.second);
 
   // Find the keys.
   std::vector<Data> keys;
@@ -319,11 +492,12 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
     if (events[i].code & FIXED)
       fixed.push_back(i);
     else if (events[i].data == i) {
-      events[i].code |= KEY;
-      events[i].data = 0;
+      events[i].data = 0; //< mark before clearing?
       keys.push_back(i);
     }
   }
+  // for (auto i : keys)
+  //  events[]
   for (auto i : fixed) printf("fixed : %3d [%d]\n", i, events[i].data);
   for (auto i : keys) printf("key : %3d\n", i);
 
@@ -332,12 +506,44 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
   uniqued.push_back(*conflicts.begin());
   for (auto i = conflicts.begin() + 1, e = conflicts.end(); i != e; ++i)
     if (*i != i[-1]) uniqued.push_back(*i);
+  for (auto i : fixed_conflicts) printf("+ %d, %d\n", i.first, i.second);
   for (auto i : uniqued) printf("> %d, %d\n", i.first, i.second);
 
+#endif
+
+#if 0
   for (auto i : uniqued) {
     events[i.first].data++;
     events[i.second].data++;
   }
+
+  std::sort(keys.begin(), keys.end(), [&](Data i, Data j) {
+    return events[i].data < events[j].data ||
+      events[i].data == events[j].data && i < j;
+  });
+  for (auto i : keys) printf("key+ : %3d [%d]\n", i, events[i].data);
+  for (size_t i = 0, e = keys.size(); i < e; ++i)
+    events[keys[i]].data = (Data)i;
+#endif
+
+  //for (auto& i : uniqued) {
+  //  i.first = events[i].first
+  //}
+
+  //for (auto i : keys)
+
+#if 0
+  struct Work {
+    Data index;
+    Data invalid;
+    Data preferred;
+    Work(Data index) : index(index) {}
+  };
+
+  std::vector<Work> the_work;
+  for (auto i : keys)
+    the_work.push_back(i);
+#endif
 
 #if 0
   for (Instruction* i = instrs, *e = instrs + numInstrs; i != e; ++i) {
@@ -442,11 +648,11 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
 #endif
 }
 
-Opcode countedMarker;
+size_t countedMarker = -1;
 
 size_t RegisterAllocator::countEvents(SExpr* expr) {
   if (expr->getBackendID()) return 0;
-  expr->setBackendID(&countedMarker);
+  expr->setBackendID((void*)countedMarker);
   switch (expr->opcode()) {
     case COP_Literal:
       return 2;
@@ -456,9 +662,9 @@ size_t RegisterAllocator::countEvents(SExpr* expr) {
       int size = countEvents(cast<BinaryOp>(expr)->expr0()) +
                  countEvents(cast<BinaryOp>(expr)->expr1());
       switch (cast<BinaryOp>(expr)->binaryOpcode()) {
-      case BOP_Add: return size + 6;
-      case BOP_Sub: return size + 7;
-      case BOP_Mul: return size + 10;
+      case BOP_Add: return size + 5;
+      case BOP_Sub: return size + 5;
+      case BOP_Mul: return size + 8;
       case BOP_Eq: return size + 4;
       case BOP_Lt: return size + 4;
       case BOP_Leq: return size + 4;
@@ -483,8 +689,9 @@ size_t RegisterAllocator::countEvents(SExpr* expr) {
 
 size_t RegisterAllocator::emitBlockHeader(EventStream events, size_t index,
                                           Block* block) {
-  if (!block->dominator) return index;
-  if (block->head != block)
+  if (!block->dominator)
+    events[index++] = Event(NOP, 0);
+  else if (block->head != block)
     events[index++] = Event(HEADER_DOMINATES, block->head->firstEvent);
   else
     events[index++] = Event(
@@ -494,17 +701,14 @@ size_t RegisterAllocator::emitBlockHeader(EventStream events, size_t index,
 
 size_t RegisterAllocator::emitArgument(EventStream events, size_t index, Phi* phi) {
   size_t result = index;
-  events[index++] = Event(PHI, result);
-  phi->setBackendID(&events[result].code);
+  events[index++] = Event(PHI | GP_REGS, result);
+  phi->setBackendID((void*)result);
   return index;
 }
 
-static size_t getBackendID(EventStream events, SExpr* expr) {
-  return (size_t)((Opcode*)expr->getBackendID() - events.codes);
-}
-
-size_t RegisterAllocator::emitEvents(EventStream events, size_t index, SExpr* expr) {
-  if (expr->getBackendID() != &countedMarker) return index;
+size_t RegisterAllocator::emitEvents(EventStream events, size_t index,
+                                     SExpr* expr) {
+  if ((size_t)expr->getBackendID() != countedMarker) return index;
   size_t result = 0;
   switch (expr->opcode()) {
     case COP_Literal: {
@@ -512,7 +716,7 @@ size_t RegisterAllocator::emitEvents(EventStream events, size_t index, SExpr* ex
       switch (literal->valueType().Base) {
         case ValueType::BT_Int:
           result = index;
-          events[index++] = Event(VALUE | ALIAS_GENERAL, result);
+          events[index++] = Event(VALUE | GP_REGS, result);
           events[index++] = Event(INT32, (Data)literal->as<int>().value());
           break;
         default:
@@ -523,73 +727,68 @@ size_t RegisterAllocator::emitEvents(EventStream events, size_t index, SExpr* ex
     case COP_Variable: {
       auto definition = cast<Variable>(expr)->definition();
       index = emitEvents(events, index, definition);
-      result = (Opcode*)definition->getBackendID() - events.codes;
+      result = (size_t)definition->getBackendID();
       break;
     }
     case COP_BinaryOp: {
       auto binaryOp = cast<BinaryOp>(expr);
       index = emitEvents(events, index, binaryOp->expr0());
       index = emitEvents(events, index, binaryOp->expr1());
-      printf("?? %d : %d %d\n", binaryOp->binaryOpcode(),
-             binaryOp->expr0()->opcode(),
-             binaryOp->expr1()->opcode());
-      auto arg0 = getBackendID(events, binaryOp->expr0());
-      auto arg1 = getBackendID(events, binaryOp->expr1());
+      //printf("?? %d : %d %d\n", binaryOp->binaryOpcode(),
+      //       binaryOp->expr0()->opcode(),
+      //       binaryOp->expr1()->opcode());
+      auto arg0 = (size_t)binaryOp->expr0()->getBackendID();
+      auto arg1 = (size_t)binaryOp->expr1()->getBackendID();
       switch (binaryOp->binaryOpcode()) {
         case BOP_Add:
           // TODO: add cases for types
           // TODO: sort out the lea/add issue
-          result = index + 3;
-          events[index++] = Event(USE, arg0);
-          events[index++] = Event(COPY | ALIAS_GENERAL, result);
+          result = index + 2;
           events[index++] = Event(USE, arg1);
-          events[index++] = Event(VALUE | ALIAS_GENERAL, result);
-          events[index++] = Event(VALUE | ALIAS_FLAGS, result + 1);
+          events[index++] = Event(USE, arg0);
+          events[index++] = Event(COPY | GP_REGS, result);
+          events[index++] = Event(USE_EFLAGS, result + 1);
           events[index++] = Event(ADD, 0);
           break;
         case BOP_Sub:
           // TODO: add cases for types
-          result = index + 2;
+          result = index + 1;
           events[index++] = Event(USE, arg0);
-          events[index++] = Event(COPY | ALIAS_GENERAL, result - 1);
-          events[index++] = Event(VALUE | ALIAS_GENERAL, result);
+          events[index++] = Event(COPY | GP_REGS, result);
           events[index++] = Event(USE, arg1);
-          events[index++] = Event(COPY | ALIAS_GENERAL, arg1);
-          events[index++] = Event(VALUE | ALIAS_FLAGS, result + 3);
+          events[index++] = Event(USE_EFLAGS, result + 2);
           events[index++] = Event(ADD, 0);
           break;
         case BOP_Mul:
-          result = index + 7;
-          events[index++] = Event(USE, arg0);
-          events[index++] = Event(COPY | FIXED | ALIAS_GENERAL, 0);
-          events[index++] = Event(USE, arg1);
-          events[index++] = Event(COPY | FIXED | ALIAS_GENERAL, 1);
-          events[index++] = Event(VALUE | FIXED | ALIAS_GENERAL, 0);
-          events[index++] = Event(VALUE | FIXED | ALIAS_GENERAL, 1);
-          events[index++] = Event(USE, result - 3);
-          events[index++] = Event(COPY | ALIAS_GENERAL, result);
-          events[index++] = Event(VALUE | ALIAS_FLAGS, result + 1);
+          result = index + 5;
+          events[index++] = Event(USE, arg0); //< can be whatever, will be copied
+          events[index++] = Event(USE, arg1); //< can be whatever, will be copied
+          events[index++] = Event(USE_EAX, arg0);
+          events[index++] = Event(USE_EDX, arg1);
+          events[index++] = Event(USE_EAX, result);
+          events[index++] = Event(VALUE | GP_REGS, result);
+          events[index++] = Event(USE_EFLAGS, result + 1);
           events[index++] = Event(MUL, 0);
           break;
         case BOP_Eq:
           result = index + 2;
           events[index++] = Event(USE, arg0);
           events[index++] = Event(USE, arg1);
-          events[index++] = Event(VALUE | ALIAS_FLAGS, result);
+          events[index++] = Event(VALUE | FLAGS_REGS, result);
           events[index++] = Event(EQ, 0);
           break;
         case BOP_Lt:
           result = index + 2;
           events[index++] = Event(USE, arg0);
           events[index++] = Event(USE, arg1);
-          events[index++] = Event(VALUE | ALIAS_FLAGS, result);
+          events[index++] = Event(VALUE | FLAGS_REGS, result);
           events[index++] = Event(LT, 0);
           break;
         case BOP_Leq:
           result = index + 2;
           events[index++] = Event(USE, arg0);
           events[index++] = Event(USE, arg1);
-          events[index++] = Event(VALUE | ALIAS_FLAGS, result);
+          events[index++] = Event(VALUE | FLAGS_REGS, result);
           events[index++] = Event(LE, 0);
           break;
         default:
@@ -602,7 +801,7 @@ size_t RegisterAllocator::emitEvents(EventStream events, size_t index, SExpr* ex
       assert(false);
       return 0;
   }
-  expr->setBackendID(&events[result].code);
+  expr->setBackendID((void*)result);
   return index;
 }
 
@@ -635,9 +834,9 @@ size_t RegisterAllocator::emitTerminator(EventStream events,
       // for (auto arg : arguments)
       //  nextEvent = emitEvents(nextEvent, cast<Phi>(arg)->values()[phiIndex]);
       for (auto arg : arguments) {
-        size_t arg0 = getBackendID(events, cast<Phi>(arg)->values()[phiIndex]);
+        auto arg0 = (size_t)cast<Phi>(arg)->values()[phiIndex]->getBackendID();
         events[index++] = Event(USE, arg0);
-        events[index++] = Event(COPY | ALIAS_GENERAL, targetPhiIndex++);
+        events[index++] = Event(PHI_COPY | GP_REGS, targetPhiIndex++);
       }
       events[result = index++] = Event(JUMP, 0);
       break;
@@ -646,7 +845,7 @@ size_t RegisterAllocator::emitTerminator(EventStream events,
       auto branch = cast<Branch>(term);
       auto condition = branch->condition();
       index = emitEvents(events, index, condition);
-      events[index++] = Event(USE, (Opcode*)condition->getBackendID() - events.codes);
+      events[index++] = Event(USE, (size_t)condition->getBackendID());
       events[result = index++] = Event(BRANCH, 0);
       break;
     }
@@ -654,13 +853,14 @@ size_t RegisterAllocator::emitTerminator(EventStream events,
       auto ret = cast<Return>(term);
       auto value = ret->returnValue();
       index = emitEvents(events, index, value);
-      events[index++] = Event(USE, (Opcode*)value->getBackendID() - events.codes);
-      events[index++] = Event(COPY | FIXED | ALIAS_GENERAL, 0);
+      auto arg0 = (size_t)value->getBackendID();
+      events[index++] = Event(USE, arg0);
+      events[index++] = Event(USE_EAX, arg0);
       events[result = index++] = Event(RET, 0);
       break;
     }
   }
-  term->setBackendID(&events[result].code);
+  term->setBackendID((void*)result);
   return index;
 }
 
