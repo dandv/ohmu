@@ -107,7 +107,8 @@ struct Sidecar {
   Data invalid;
 };
 
-void print(EventStream events, size_t numInstrs);
+void print_stream(EventStream events, size_t numInstrs);
+void print_asm(EventStream events, size_t numInstrs);
 
 #if 0
 namespace Jagger {

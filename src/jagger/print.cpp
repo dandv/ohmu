@@ -40,7 +40,7 @@ static char OpcodeNames[][20] = {
   "MEMSET", "MEMCPY",
 };
 
-void print(EventStream events, size_t numInstrs) {
+void print_stream(EventStream events, size_t numInstrs) {
   for (size_t i = 0; i < numInstrs; ++i) {
     auto code = events[i].code;
     printf("%3d > ", i);
@@ -56,6 +56,63 @@ void print(EventStream events, size_t numInstrs) {
   }
 }
 
+void print_asm(EventStream events, size_t numInstrs) {
+  for (size_t i = 0; i < numInstrs; ++i) {
+    auto code = events[i].code;
+    if (code & VALUE) {
+      if (!(code & 0x20)) continue;  //< is not a copy
+      auto dst = events[i].data;
+      if ((code & VALUE_MASK) == PHI_COPY) dst = events[dst].data;
+      auto src = events[events[i - 1].data].data;
+      if (src != dst) printf("copy %02x %02x\n", dst, src);
+      continue;
+    }
+    if (code <= HEADER_DOMINATES)
+      continue;
+    switch (code) {
+    case INT32:
+      printf("mov %02x '%d'\n", events[i - 1].data, events[i].data);
+      break;
+    case ADD: {
+      auto dst = events[i - 2].data;
+      if (events[i - 2].code == MUTED_USE)
+        dst = events[dst].data;
+      auto src = events[events[i - 4].data].data;
+      printf("add %02x %02x\n", dst, src);
+      break;
+    }
+    case SUB:
+      printf("sub %02x %02x\n", events[events[i - 3].data].data,
+        events[events[i - 2].data].data);
+      break;
+    case MUL: {
+      auto dst = events[events[i - 9].data].data;
+      auto src = events[events[i - 8].data].data;
+      if (src == 1 || dst == 2) std::swap(src, dst);
+      if (dst != 1) printf("copy 01 %02x\n", dst);
+      if (src != 2) printf("copy 02 %02x\n", src);
+      printf("mul 01 02\n");
+      if (events[i - 2].data != 1) printf("copy %02x 01\n", events[i - 2].data);
+      break;
+    }
+    case EQ:
+      printf("cmp %02x %02x\n", events[events[i - 3].data].data,
+             events[events[i - 2].data].data);
+      break;
+    case JUMP:
+      printf("JUMP ???\n");
+      break;
+    case BRANCH:
+      printf("JE ???\n");
+      break;
+    case RET:
+      if (events[events[i - 2].data].data != 1)
+        printf("copy 01 %0x2", events[events[i - 2].data].data);
+      break;
+    default: printf("unknown op! %02x\n", code);
+    }
+  }
+}
 
 #if 0
 namespace Jagger {

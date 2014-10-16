@@ -249,7 +249,7 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
     auto event = events[i];
     if (event.code == USE) {
       auto target = events[event.data];
-      //printf("%d %d\n", event.data, target.data);
+      //printf("%d : %d %d\n", i, event.data, target.data);
       assert(target.data == event.data);
       //printf("%02x\n", target.code);
       assert((target.code & VALUE_MASK) == VALUE ||
@@ -275,6 +275,15 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
     }
   }
 
+  //Commute commutable operations to save copies.
+  for (size_t i = 0; i < numEvents; i++) {
+    if (events[i].code != ADD) continue;
+    if (events[i - 3].code == MUTED_USE && events[i - 4].code == USE) {
+      std::swap(events[i - 3].code, events[i - 4].code);
+      std::swap(events[i - 3].data, events[i - 4].data);
+    }
+  }
+
   // Link copies.
   for (size_t i = 0; i < numEvents; i++) {
     auto event = events[i];
@@ -283,7 +292,7 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
       if (use.code == MUTED_USE) continue;
       event.data = use.data;
       use.code = MUTED_USE;
-      event.code = NOP; // TODO: should we do this?
+      event.code = MUTED_USE;
     }
     else if ((event.code & VALUE_MASK) == PHI_COPY) {
       auto use = events[i - 1];
@@ -296,9 +305,7 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
   // Traverse the keys.
   for (size_t i = 0; i < numEvents; i++) {
     auto event = events[i];
-    //if (event.code < VALUE) continue;
-    if (event.code < VALUE)
-      continue;
+    if (!(event.code & VALUE)) continue;
     size_t key = i;
     do {
       key = events[key].data;
@@ -310,7 +317,7 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
     if (event.code != USE && event.code != MUTED_USE) continue;
     // Note: this is a bit tricky...
     if ((events[event.data].code & VALUE_MASK) == PHI) continue;
-    events[i].data = events[events[i].data].data;
+    event.data = events[event.data].data;
   }
 
   // Mark conflicts.
@@ -327,6 +334,7 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
         fixed_conflicts.push_back(
             std::make_pair(key, 1 << ((other.code >> 3) & 0x7)));
       } else {
+        //printf("%d : %d : %d %d\n", i, &other.code - events.codes, key, other.data);
         assert(other.data != key);
         auto other_key = other.data;
         conflicts.push_back(
@@ -334,6 +342,15 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
         //printf("conflict: %d : %d\n", key, other_key);
       }
     }
+  }
+
+  // Traverse the keys.
+  for (size_t i = 0; i < numEvents; i++) {
+    auto event = events[i];
+    if (!(event.code == USE || event.code == MUTED_USE ||
+          (event.code & VALUE) && (event.code & VALUE_MASK) != VALUE))
+      continue;
+    events[i].data = events[events[i].data].data;
   }
 
   // Clean conflicts? (otherwise they confuse the goal marker)
@@ -448,9 +465,16 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
        i != e; ++i) {
     auto preferred = sidecar[i].preferred;
     auto invalid = sidecar[i].invalid;
+    auto unpreferred = 0;
     for (size_t j = g; j < g_end && goals[j].first == i; j++)
       preferred |= sidecar[goals[j].second].preferred;
-    auto x = preferred & ~invalid;
+    for (size_t j = c; j < c_end && conflicts[j].first == i; j++) {
+      unpreferred |= sidecar[conflicts[j].second].preferred;
+      if (work[i].index == 76) printf("!!!!!!!! %0x\n", unpreferred);
+    }
+    auto x = ~unpreferred & preferred & ~invalid;
+    if (!x) x = preferred & ~invalid;
+    if (!x) x = ~unpreferred & ~invalid;
     if (!x) x = ~invalid;
     x = x & -x;
     work[i].count = x;
@@ -469,165 +493,6 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
       sidecar[i].invalid, sidecar[i].preferred);
   }
   printf("\n");
-
-#if 0
-  for (auto i : joins) printf("x %d, %d\n", i.first, i.second);
-  printf("----\n");
-  for (auto& i : joins) {
-    auto& event0 = events[i.first];
-    auto& event1 = events[i.second];
-    if (!(event0.code & FIXED)) i.first = event0.data;
-    if (!(event1.code & FIXED)) i.second = event1.data;
-    if (i.first > i.second)
-      std::swap(i.first, i.second);
-  }
-  std::sort(joins.begin(), joins.end());
-  for (auto i : joins) printf("x %d, %d\n", i.first, i.second);
-
-  // Find the keys.
-  std::vector<Data> keys;
-  std::vector<Data> fixed;
-  for (size_t i = 0; i < numEvents; ++i) {
-    if (!(events[i].code & VALUE)) continue;
-    if (events[i].code & FIXED)
-      fixed.push_back(i);
-    else if (events[i].data == i) {
-      events[i].data = 0; //< mark before clearing?
-      keys.push_back(i);
-    }
-  }
-  // for (auto i : keys)
-  //  events[]
-  for (auto i : fixed) printf("fixed : %3d [%d]\n", i, events[i].data);
-  for (auto i : keys) printf("key : %3d\n", i);
-
-  std::sort(conflicts.begin(), conflicts.end());
-  std::vector<std::pair<Data, Data>> uniqued;
-  uniqued.push_back(*conflicts.begin());
-  for (auto i = conflicts.begin() + 1, e = conflicts.end(); i != e; ++i)
-    if (*i != i[-1]) uniqued.push_back(*i);
-  for (auto i : fixed_conflicts) printf("+ %d, %d\n", i.first, i.second);
-  for (auto i : uniqued) printf("> %d, %d\n", i.first, i.second);
-
-#endif
-
-#if 0
-  for (auto i : uniqued) {
-    events[i.first].data++;
-    events[i.second].data++;
-  }
-
-  std::sort(keys.begin(), keys.end(), [&](Data i, Data j) {
-    return events[i].data < events[j].data ||
-      events[i].data == events[j].data && i < j;
-  });
-  for (auto i : keys) printf("key+ : %3d [%d]\n", i, events[i].data);
-  for (size_t i = 0, e = keys.size(); i < e; ++i)
-    events[keys[i]].data = (Data)i;
-#endif
-
-  //for (auto& i : uniqued) {
-  //  i.first = events[i].first
-  //}
-
-  //for (auto i : keys)
-
-#if 0
-  struct Work {
-    Data index;
-    Data invalid;
-    Data preferred;
-    Work(Data index) : index(index) {}
-  };
-
-  std::vector<Work> the_work;
-  for (auto i : keys)
-    the_work.push_back(i);
-#endif
-
-#if 0
-  for (Instruction* i = instrs, *e = instrs + numInstrs; i != e; ++i) {
-    if (i->opcode == &globalOpcodes.phi)
-      continue;
-    if (i->opcode->hasArg0 && !i->arg0Live) traverse(i, i->arg0);
-    if (i->opcode->hasArg1 && !i->arg1Live) traverse(i, i->arg1);
-  }
-
-  assert(!interactions.empty());
-  // We should really just return in this case.
-
-  std::sort(interactions.begin(), interactions.end());
-  std::vector<std::pair<int, int>> uniqued;
-  uniqued.push_back(*interactions.begin());
-  for (auto i = interactions.begin() + 1, e = interactions.end(); i != e; ++i)
-    if (*i != i[-1]) uniqued.push_back(*i);
-  for (auto i : uniqued) printf("> %d, %d\n", i.first, i.second);
-  for (auto i : uniqued) {
-    instrs[i.first].pressure++;
-    instrs[i.second].pressure++;
-  }
-
-  std::vector<std::<int, int>> shared;
-  for (Instruction* i = instrs, *e = instrs + numInstrs; i != e; ++i)
-    if (i->opcode == &globalOpcodes.add || i->opcode == &globalOpcodes.mul ||
-        i->opcode == &globalOpcodes.cmpeq) {
-    shared.push_back(std::make_pair());
-    }
-
-  std::vector<Instruction*> work;
-  for (auto i = instrs, e = instrs + numInstrs; i != e; ++i) work.push_back(i);
-  std::sort(work.begin(), work.end(), [](Instruction* a, Instruction* b) {
-    return a->pressure < b->pressure || a->pressure == b->pressure && a < b;
-  });
-  for (auto i : work) printf("%d : %d\n", i - instrs, i->pressure);
-
-  for (auto& i : uniqued)
-    if (instrs[i.first].pressure > instrs[i.second].pressure ||
-        instrs[i.first].pressure == instrs[i.second].pressure &&
-            i.first > i.second) {
-      i = std::make_pair(i.second, i.first);
-      printf("*");
-    } else
-      printf(".");
-  printf("\n");
-
-  // for (auto i : uniqued) printf("> %d, %d\n", i.first, i.second);
-  // printf("\n");
-  std::sort(uniqued.begin(), uniqued.end(),
-            [&](std::pair<int, int> a, std::pair<int, int> b) {
-    return instrs[a.first].pressure < instrs[b.first].pressure ||
-           instrs[a.first].pressure == instrs[b.first].pressure &&
-               a.first < b.first;
-  });
-  for (auto i : uniqued) printf("> %d, %d\n", i.first, i.second);
-
-  auto interaction = uniqued.begin();
-  for (auto i : work) {
-    i->reg = ~i->invalidRegs & -~i->invalidRegs;
-    while (interaction != uniqued.end() && instrs + interaction->first == i)
-      instrs[interaction++->second].invalidRegs |= i->reg;
-  }
-
-#if 1
-      // for debugging
-      std::vector<std::pair<int, int>> ranges;
-  auto point = uniqued.begin();
-  for (auto i = uniqued.begin() + 1, e = uniqued.end(); i != e; ++i)
-    if (i->first != i[-1].first) {
-      ranges.push_back(
-          std::make_pair(point - uniqued.begin(), i - uniqued.begin()));
-      point = i;
-    }
-  ranges.push_back(std::make_pair(point - uniqued.begin(), uniqued.size()));
-  for (auto i : ranges) printf("[%d, %d) : %d : %d\n", i.first, i.second, uniqued[i.first].first, i.second - i.first);
-#endif
-
-  printf("blocks = %d\ninstrs = %d\n", (int)numBlocks, (int)numInstrs);
-  for (size_t i = 0; i < numBlocks; i++)
-    printf("block%d\n  parent = %d\n  first = %d\n  instrs = %d\n", (int)i,
-           blocks[i].dominator ? (int)(blocks[i].dominator - blocks) : -1,
-           (int)(blocks[i].instrs - instrs), (int)blocks[i].numInstrs);
-#endif
 
 #if 0
   // Patch up all of the jump targets.
@@ -664,7 +529,7 @@ size_t RegisterAllocator::countEvents(SExpr* expr) {
       switch (cast<BinaryOp>(expr)->binaryOpcode()) {
       case BOP_Add: return size + 5;
       case BOP_Sub: return size + 5;
-      case BOP_Mul: return size + 8;
+      case BOP_Mul: return size + 10;
       case BOP_Eq: return size + 4;
       case BOP_Lt: return size + 4;
       case BOP_Leq: return size + 4;
@@ -757,13 +622,15 @@ size_t RegisterAllocator::emitEvents(EventStream events, size_t index,
           events[index++] = Event(COPY | GP_REGS, result);
           events[index++] = Event(USE, arg1);
           events[index++] = Event(USE_EFLAGS, result + 2);
-          events[index++] = Event(ADD, 0);
+          events[index++] = Event(SUB, 0);
           break;
         case BOP_Mul:
-          result = index + 5;
-          events[index++] = Event(USE, arg0); //< can be whatever, will be copied
-          events[index++] = Event(USE, arg1); //< can be whatever, will be copied
+          result = index + 7;
+          events[index++] = Event(USE, arg0);
+          events[index++] = Event(USE, arg1);
           events[index++] = Event(USE_EAX, arg0);
+          events[index++] = Event(USE_EDX, arg0);
+          events[index++] = Event(USE_EAX, arg1);
           events[index++] = Event(USE_EDX, arg1);
           events[index++] = Event(USE_EAX, result);
           events[index++] = Event(VALUE | GP_REGS, result);
@@ -864,506 +731,12 @@ size_t RegisterAllocator::emitTerminator(EventStream events,
   return index;
 }
 
-#if 0
-
-#if 0
-namespace {
-struct Pool {
-  Pool() : data((char*)malloc(0x100)), capacity(0x100), size(0) {}
-
-  template <typename T>
-  T* allocate(size_t quantity) {
-    assert(!(sizeof(T) % 4) && __alignof(T) <= 4);
-    size_t offset = size;
-    if (quantity) {
-      size += sizeof(T) * quantity;
-      while (size > capacity) data = (char*)realloc(data, capacity *= 2);
-    }
-    return (T*)(data + offset);
-  }
-
-  size_t getSize() const { return size; }
-  int getOffset() const { assert((int)size == size); return (int)size; }
-  char* getBase() const { return data; }
-
- private:
-  char* data;
-  size_t capacity;
-  size_t size;
-};
-#endif
-
-struct InstructionStream {
-#if 0
-  int getNewInstr() const { return pool.getOffset(); }
-  int getLastInstr() const { return getNewInstr() - sizeof(Instruction); }
-  int getNewBlock() const { return pool.getOffset(); }
-  int getLastBlock() const { return getNewBlock() - sizeof(Block); }
-#endif
-
-  int countBytes(SCFG* cfg) const;
-  int countInstrs(SExpr* expr) const;
-  int countInstrs(BasicBlock* block) const;
-
-#if 0
-  void emitBlock(BasicBlock* block);
-  //void emitBlockLink(BasicBlock* block);
-  void emitEchos(Phi* phi);
-  void emitPhi(Phi* phi);
-  void encode(SCFG* cfg);
-
-  int emitExpression(SExpr* expr);
-  void emitTerminator(BasicBlock* basicBlock);
-
-  void emitLiteral(Literal* literal);
-  void emitBinaryOp(BinaryOp* binaryOp);
-  void emitJump(BasicBlock* basicBlock, Goto* jump);
-  void emitBranch(BasicBlock* basicBlock, Branch* branch);
-
-  void printWalk(Instruction* instr, Instruction* target);
-  void printWalks();
-#endif
-
-#if 0
-  void computePressure(Event* event);
-  unsigned computeValidRegs(Event* event, Event*& source);
-  void markInvalidRegs(Event* event);
-  void propegateCopies(Event* source, unsigned reg);
-  void untwistPairs(Event* event);
-#endif
-
-private:
-  //Block* currentBlock;
-  //Pool pool;
-  //void* root;
-  void* root;
-};
-} // namespace
-
-int InstructionStream::countBytes(SCFG* cfg) const {
-  int numBlocks = 0;
-  int numInstrs = 0;
-  for (auto block : *cfg) {
-    numBlocks++;
-    numInstrs += countInstrs(block);
-  }
-  printf("blocks = %d\ninstrs = %d\n", numBlocks, numInstrs);
-  return numBlocks * (int)sizeof(Block) + numInstrs * (int)sizeof(Instruction);
-}
-
-int InstructionStream::countInstrs(BasicBlock* block) const {
-  int x = 0;
-  // count the number of phi instructions.  Because phi instructions are binary
-  // we need n-1 of them to make a tree of phi/tie instructions with n leaves.
-  x += block->arguments().size() * (block->predecessors().size() - 1);
-  for (auto instr : block->instructions()) x += countInstrs(instr);
-  auto terminator = block->terminator();
-  if (!terminator)
-    x++;  // ret instruction special case
-  else
-    x += countInstrs(terminator);
-  return x;
-}
-
-int InstructionStream::countInstrs(SExpr* expr) const {
-  if (expr->id()) return 0;
-  expr->setId(1);  // all ids < 4 are special
-  switch (expr->opcode()) {
-    case COP_Literal:
-      return 1;
-    case COP_Variable:
-      return countInstrs(cast<Variable>(expr)->definition());
-    case COP_BinaryOp:
-      return countInstrs(cast<BinaryOp>(expr)->expr0()) +
-             countInstrs(cast<BinaryOp>(expr)->expr1()) + 1;
-    case COP_Goto:
-      return cast<Goto>(expr)->targetBlock()->arguments().size() + 1;
-    case COP_Branch:
-      return countInstrs(cast<Branch>(expr)->condition()) + 1;
-    default:
-      assert(false);
-      return 0;
-  }
-}
-
-void InstructionStream::emitBlock(BasicBlock* block) {
-  int blockID = block->blockID();
-  assert(blockID == (int)blocks.size());
-  BasicBlock* parent = block->DominatorNode.Parent;
-  while (parent && block->PostDominates(*parent)) // TODO: || parent is previous block
-    parent = parent->DominatorNode.Parent;
-  blocks.push_back(Block(parent ? parent->blockID() - blockID : 0, getNewID()));
-  currentBlock = &blocks.back();
-  for (auto arg : block->arguments())
-    emitPhi(cast<clang::threadSafety::til::Phi>(arg->definition()));
-  for (auto instr : block->instructions())
-    emitExpression(instr);
-  emitTerminator(block);
-  currentBlock->lastInstr = getLastID();
-}
-
-#if 0
-void InstructionStream::emitBlockLink(BasicBlock* block) {
-  if (!block->DominatorNode.Parent)
-    return;
-  int targetOffset = block->DominatorNode.Parent->VX64BlockEnd - getNewID();
-  // In this case the previous block is immediately prior and we don't need to
-  // walk or skip.
-  if (targetOffset == -1)
-    return;
-  if (block->PostDominates(*block->DominatorNode.Parent))
-    events.push_back(Link().initWalkBack(targetOffset));
-  else
-    events.push_back(Link().initSkipBack(targetOffset));
-}
-#endif
-
-void InstructionStream::emitPhi(Phi* phi) {
-  int id = getNewID();
-  if (phi->values().size() == 1) {
-    // TODO: eliminate this case in the middle-end
-    phi->setId((phi->values()[0])->id());
-    return;
-  }
-  assert(phi->values().size() == 2);
-  instrs.push_back(Instruction(
-      currentBlock,
-      &OpCodes::phi,
-      cast<Variable>(phi->values()[0])->id() - id,
-      cast<Variable>(phi->values()[1])->id() - id));
-  phi->setId(id);
-}
-
-void InstructionStream::emitLiteral(Literal* literal) {
-  switch (literal->valueType().Base) {
-  case ValueType::BT_Int:
-    instrs.push_back(Instruction(
-      currentBlock,
-      &OpCodes::intValue,
-      literal->as<int>().value()));
-    break;
-  default:
-    assert(false);
-  }
-}
-
-void InstructionStream::emitBinaryOp(BinaryOp* binaryOp) {
-  int expr0ID = emitExpression(binaryOp->expr0());
-  int expr1ID = emitExpression(binaryOp->expr1());
-  const OpCode* opcode = &OpCodes::nop;
-  switch (binaryOp->binaryOpcode()) {
-  case BOP_Add: opcode = &OpCodes::add; break;
-  case BOP_Mul: opcode = &OpCodes::mul; break;
-  case BOP_Eq : opcode = &OpCodes::cmpeq; break;
-  case BOP_Lt : opcode = &OpCodes::cmplt; break;
-  case BOP_Leq: opcode = &OpCodes::cmple; break;
-  default:
-    assert(false);
-  }
-  int site = getNewID();
-  instrs.push_back(Instruction(currentBlock, opcode, expr0ID - site, expr1ID - site));
-}
-
-int InstructionStream::emitExpression(SExpr* expr) {
-  if (expr->id())
-    return expr->id();
-  switch (expr->opcode()) {
-  case COP_Literal: emitLiteral(cast<Literal>(expr)); break;
-  case COP_Variable: emitExpression(cast<Variable>(expr)->definition()); break;
-  case COP_BinaryOp: emitBinaryOp(cast<BinaryOp>(expr)); break;
-  }
-  expr->setId(getLastID());
-  return expr->id();
-}
-
-void InstructionStream::emitTerminator(BasicBlock* basicBlock) {
-  auto expr = basicBlock->terminator();
-  if (!expr) {
-    // Presently Ohmu IR doesn't have/use ret instructions.
-    // We should figure out how to differentiate functions that return values
-    // and those that don't.
-    //assert(!instrs.empty() && instrs.back().opcode->hasResult);
-    //assert(basicBlock->instructions().size() != 0);
-    instrs.push_back(Instruction(currentBlock, &OpCodes::ret, -1));
-    return;
-  }
-  switch (expr->opcode()) {
-  case COP_Goto: emitJump(basicBlock, cast<Goto>(expr)); break;
-  case COP_Branch: emitBranch(basicBlock, cast<Branch>(expr)); break;
-  }
-}
-
-// the index for this block in the target's phis
-static size_t getPhiIndex(BasicBlock* basicBlock, BasicBlock* targetBlock) {
-  auto& predecessors = targetBlock->predecessors();
-  for (size_t i = 0, e = predecessors.size(); i != e; ++i)
-    if (predecessors[i] == basicBlock)
-      return i;
-  return 0;
-}
-
-void InstructionStream::emitJump(BasicBlock* basicBlock, Goto* jump) {
-  auto targetBlock = jump->targetBlock();
-  size_t phiIndex = getPhiIndex(basicBlock, targetBlock);
-  auto& arguments = targetBlock->arguments();
-  for (auto arg : arguments) {
-    SExpr* expr = cast<Phi>(arg->definition())->values()[phiIndex];
-    int argid = emitExpression(expr);
-    int echoid = getNewID();
-    instrs.push_back(Instruction(currentBlock, &OpCodes::echo, argid - echoid));
-    expr->setId(echoid);
-  }
-  instrs.push_back(Instruction(currentBlock, &OpCodes::jump));
-}
-
-void InstructionStream::emitBranch(BasicBlock* basicBlock, Branch* branch) {
-  // There should be no critical edges.
-  emitExpression(branch->condition());
-  instrs.push_back(Instruction(currentBlock, &OpCodes::branch,
-                               branch->condition()->id() - getNewID()));
-}
-
-void InstructionStream::encode(SCFG* cfg) {
-  for (auto block : *cfg)
-    emitBlock(block);
-  instrs.push_back(Instruction(currentBlock, &OpCodes::nop));
-  for (auto block : *cfg) {
-    Block* b = new Block();
-    // TODO:b.init();
-    emitBlock(block);
-  }
-  // Patch up all of the jump targets.
-  for (auto block : *cfg) {
-    if (!block->terminator())
-      continue;
-    switch (block->terminator()->opcode()) {
-    case COP_Goto:
-      instrs[block->VX64BlockEnd].arg1 =
-          cast<Goto>(block->terminator())->targetBlock()->VX64BlockStart - block->VX64BlockEnd;
-      break;
-    case COP_Branch:
-      instrs[block->VX64BlockEnd].arg1 =
-          cast<Branch>(block->terminator())->elseBlock()->VX64BlockStart - block->VX64BlockEnd;
-      break;
-    }
-  }
-#if 0
-  // Compute pressure generated by the pairs.
-  for (auto& event : instrs) {
-    if (event.kind != Object::USE)
-      continue;
-    computePressure(&event);
-  }
-  std::vector<Event*> ptrs;
-  for (auto& event : instrs)
-    if (event.kind == Object::USE)
-      ptrs.push_back(&event);
-  std::sort(ptrs.begin(), ptrs.end(), [](Event *a, Event *b) {
-    a = a + a->use.offsetToValue;
-    b = b + b->use.offsetToValue;
-    return a->liveRange.pressure < b->liveRange.pressure;
-  });
-#endif
-#if 0
-  for (auto ptr : ptrs) {
-    Event* source = nullptr;
-    auto registerSet = computeValidRegs(ptr, source);
-    unsigned sourceCopySet = source->value.copySet;
-    unsigned destCopySet = ptr->value.copySet;
-// FIXME if we have c = a - b, a must survive, and the total number of allocated
-// registers for c, b, and a is 2 then we have no place to squirl away a during
-// computation of c so we need to add an artifical use of a so that we get
-// another register allocated as a place to store it.
-#if 1
-    // printf(">> %x %x %x", registerSet, sourceCopySet, destCopySet);
-    if (registerSet & sourceCopySet & destCopySet) {
-      registerSet &= sourceCopySet & destCopySet;
-      //printf(" <SD>");
-    }
-    else if (registerSet & destCopySet) {
-      registerSet &= destCopySet;
-      //printf(" <D>");
-    }
-    else if (registerSet & sourceCopySet) {
-      registerSet &= sourceCopySet;
-      //printf(" <S>");
-    }
-#endif
-    unsigned reg = registerSet & -registerSet;
-    //printf(" %x : %x\n", registerSet, reg);
-    ptr->liveRange.reg = reg;
-    markInvalidRegs(ptr);
-    propegateCopies(source, reg);
-  }
-#endif
-}
-
-#if 0
-void InstructionStream::computePressure(Event* event) {
-  Event* walkTo = event;
-  for (Event* i = event - 1, *e = event + event->use.offsetToValue; i != e; --i)
-    switch (i->kind) {
-    case Object::HOLE: break;
-    case Object::WALK_BACK:
-      walkTo = std::min(walkTo, i + i->link.offsetToTarget);
-      break;
-    case Object::SKIP_BACK:
-      if (i + i->link.offsetToTarget < walkTo)
-        i += i->link.offsetToTarget;
-      break;
-    case Object::USE:
-      // TODO: this will double count some values
-      if (i < walkTo && i + i->use.offsetToValue == e)
-        return;
-      break;
-    case Object::JUMP:
-    case Object::BRANCH: break;
-    default:
-      assert(i->value.isValue());
-      assert((i + i->value.offsetToRep)->value.isValue());
-      (i + i->value.offsetToRep)->value.pressure++;
-  }
-}
-#endif
-
-#if 0
-unsigned InstructionStream::computeValidRegs(Event* event, Event*& source) {
-  unsigned validSet = ~event->liveRange.invalidRegs;
-  Event* walkTo = event;
-  for (Event* i = event - 1, *e = event + event->liveRange.offsetToOrigin; i != e; --i)
-    switch (i->kind) {
-    case Object::WALK_BACK:
-      walkTo = std::min(walkTo, i + i->link.offsetToTarget);
-      break;
-    case Object::SKIP_BACK:
-      if (i + i->link.offsetToTarget < walkTo)
-        i += i->link.offsetToTarget;
-      break;
-    case Object::LIVE_RANGE:
-      if (i < walkTo && i + i->liveRange.offsetToOrigin == e) {
-        source = i;
-        return validSet;
-      }
-      validSet &= ~(i->liveRange.reg | i->value.copySet | i->liveRange.invalidRegs);
-    }
-  source = event + event->liveRange.offsetToOrigin;
-  return validSet;
-}
-#endif
-
-#if 0
-void InstructionStream::markInvalidRegs(Event* event) {
-  unsigned reg = event->liveRange.reg;
-  Event* walkTo = event;
-  for (Event* i = event - 1, *e = event + event->liveRange.offsetToOrigin; i != e; --i)
-    switch (i->kind) {
-    case Object::WALK_BACK:
-      walkTo = std::min(walkTo, i + i->link.offsetToTarget);
-      break;
-    case Object::SKIP_BACK:
-      if (i + i->link.offsetToTarget < walkTo)
-        i += i->link.offsetToTarget;
-      break;
-    case Object::LIVE_RANGE:
-      if (i < walkTo && i + i->liveRange.offsetToOrigin == e)
-        return;
-      i->liveRange.invalidRegs |= reg;
-    }
-}
-#endif
-
-#if 0
-void InstructionStream::propegateCopies(Event* source, unsigned reg) {
-  if (source->kind == Object::PHI) {
-    int key = source->phiLink.key;
-    do {
-      propegateCopies(source + source->phiLink.offsetToTarget, reg);
-      --source;
-    } while (source->kind == Object::PHI && source->phiLink.key == key);
-    return;
-  }
-  assert(source->object.isValue());
-  source->value.copySet |= reg;
-}
-#endif
-
-#if 0
-void InstructionStream::untwistPairs(Event* event) {
-  if (event->kind != Object::ADD)
-    return;
-  unsigned copySet = event->instruction.copySet;
-  unsigned reg0 = event[-2].liveRange.reg;
-  unsigned reg1 = event[-1].liveRange.reg;
-  if (!(reg0 & copySet) && (reg1 & copySet))
-    std::swap(event[-2].liveRange.reg, event[-1].liveRange.reg);
-}
-#endif
-
-void InstructionStream::printWalk(Instruction* instr, Instruction* target) {
-  Instruction* first = instrs.data() + instr->block->firstInstr;
-}
-
-void InstructionStream::printWalks() {
-  //return;
-  for (size_t i = 0, e = instrs.size(); i != e; ++i) {
-    Instruction* instr = &instrs[i];
-    if (!instr->opcode->hasArg0)
-      continue;
-    Instruction* first = instrs.data() + instr->block->firstInstr;
-    //printf("first = %d\n", first - instrs.data());
-    if (instr->opcode->hasArg0) {
-      Instruction* target = instr + instr->arg0;
-      printf("? %d => %d\n", i, i + instr->arg0);
-      for (;;) {
-        for (; instr != target && instr >= first; instr--)
-          printf("%d->", instr - instrs.data());
-        if (instr == target)
-          break;
-        //break;
-        const Block* block = instr->block;
-        assert(instrs.data() + block->firstInstr == instr + 1);
-        if (!block->parent)
-          break;
-        //printf("block : %d parent : %d current : %d next : %d target : %d\n",
-        //  block - blocks.data(), );
-        instr += (block + block->parent)->lastInstr - block->firstInstr - 1;
-      }
-      printf("%d\n", instr - instrs.data());
-      instr = &instrs[i];
-    }
-#if 0
-    if (instr->opcode->hasArg1) {
-      Instruction* target = instr + instr->arg1;
-      printf("? %d => %d\n", i, i + instr->arg1);
-      for (;;) {
-        for (; instr != target && instr >= first; instr--)
-          printf("%d->", instr - instrs.data());
-        if (instr == target)
-          break;
-        //break;
-        const Block* block = instr->block;
-        assert(instrs.data() + block->firstInstr == instr + 1);
-        if (!block->parent)
-          break;
-        //printf("block : %d parent : %d current : %d next : %d target : %d\n",
-        //  block - blocks.data(), );
-        instr += (block + block->parent)->lastInstr - block->firstInstr - 1;
-      }
-      printf("%d\n", instr - instrs.data());
-    }
-#endif
-  }
-}
-
-// FIXME put me in a header
-//extern void emitASM(X64Builder& builder, Event* events, size_t numEvents);
-#endif
-
 void encode(SCFG* cfg, char* output) {
   RegisterAllocator allocator;
   allocator.encode(&cfg, 1);
 
-  print(allocator.events, allocator.numEvents);
+  print_stream(allocator.events, allocator.numEvents);
+  print_asm(allocator.events, allocator.numEvents);
   //stream.printWalks();
   //X64Builder builder;
   //emitASM(builder, InstructionStream.events.data(), InstructionStream.events.size());
