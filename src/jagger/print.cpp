@@ -18,6 +18,7 @@
 #include "types.h"
 #include <stdio.h>
 #include <map>
+#include "x64builder\x64builder.h"
 
 static char OpcodeNames[][20] = {
   "NOP", "USE", "MUTED_USE", "HEADER", "HEADER_DOMINATES",
@@ -56,8 +57,8 @@ void print_stream(EventStream events, size_t numInstrs) {
   }
 }
 
-void print_asm(EventStream events, size_t numInstrs) {
-  for (size_t i = 0; i < numInstrs; ++i) {
+void print_asm(EventStream events, size_t numEvents) {
+  for (size_t i = 0; i < numEvents; ++i) {
     auto code = events[i].code;
     if (code & VALUE) {
       if (!(code & 0x20)) continue;  //< is not a copy
@@ -100,10 +101,10 @@ void print_asm(EventStream events, size_t numInstrs) {
              events[events[i - 2].data].data);
       break;
     case JUMP:
-      printf("JUMP ???\n");
+      printf("JUMP %d\n", events[i].data);
       break;
     case BRANCH:
-      printf("JE ???\n");
+      printf("JE %d\n", events[i].data);
       break;
     case RET:
       if (events[events[i - 2].data].data != 1)
@@ -114,44 +115,75 @@ void print_asm(EventStream events, size_t numInstrs) {
   }
 }
 
-#if 0
-namespace Jagger {
-void print(Instrs instrs, size_t numInstrs);
-void Instruction::print(const Instruction* base) {
-#if 0
-  std::map<Opcode, const OpcodeInfo*> exmap;
-  exmap.insert(std::make_pair(Opcodes::add, &Opcodes::add));
-  auto query = exmap.find(this->opcode);
-  auto opcode = query == exmap.end() ? &Opcodes::unknown : query->second;
-  printf("%3d %-10s", this - base, opcode->name);
-  if (opcode == ) printf(" jump to %d", arg1 - base);
-  if (opcode->hasResult)
-    printf(" |%3d| {%04x (%04x) : %04x} [%2d]", key - base, ~invalidRegs,
-           preferredRegs, reg, pressure);
-  if (opcode->hasArg0) {
-    printf(" (%d", arg0 - base);
-    if (!arg0Live)
-      printf("*");
-    if (opcode->hasArg1) {
-      printf(", %d", arg1 - base);
-      if (!arg1Live)
-        printf("*");
-    }
-    printf(")");
-  }
-  if (opcode->isIntLiteral)
-    printf(" %-3d ", arg0);
-  printf("\n");
-#endif
-  printf("%3d > %s", this - base, OpcodeNames[this->opcode.code]);
-  if (this->arg0) printf(" : %d", this->getArg0() - base);
-  if (this->arg1) printf(", %d", this->getArg1() - base);
-  printf("\n");
+GP32Reg reg(Data value) {
+  assert(value == (value & -value));
+  unsigned ret;
+  _BitScanForward((unsigned long*)&ret, value);
+  return (GP32Reg)ret;
 }
 
-void print(Instruction* instrs, size_t numInstrs) {
-  for (auto i = instrs, e = instrs + numInstrs; i != e; ++i)
-    i->print(instrs);
+void make_asm(EventStream events, size_t numEvents) {
+  X64Builder builder;
+  for (size_t i = 0; i < numEvents; ++i) {
+    auto code = events[i].code;
+    if (code & VALUE) {
+      if (!(code & 0x20)) continue;  //< is not a copy
+      auto dst = events[i].data;
+      if ((code & VALUE_MASK) == PHI_COPY) dst = events[dst].data;
+      auto src = events[events[i - 1].data].data;
+      if (src != dst) builder.MOV(reg(dst), reg(src));
+      continue;
+    }
+    if (code < HEADER)
+      continue;
+    if (code <= HEADER_DOMINATES)
+      builder.Label();
+    switch (code) {
+    case INT32:
+      builder.MOV(reg(events[i - 1].data), (int)events[i].data);
+      break;
+    case ADD: {
+      auto dst = events[i - 2].data;
+      if (events[i - 2].code == MUTED_USE)
+        dst = events[dst].data;
+      auto src = events[events[i - 4].data].data;
+      builder.ADD(reg(dst), reg(src));
+      break;
+    }
+    case SUB:
+      builder.ADD(reg(events[events[i - 3].data].data), reg(events[events[i - 2].data].data));
+      break;
+    case MUL: {
+      auto dst = events[events[i - 9].data].data;
+      auto src = events[events[i - 8].data].data;
+      if (src == 1 || dst == 2) std::swap(src, dst);
+      if (dst != 1) builder.MOV(EAX, reg(dst));
+      if (src != 2) builder.MOV(EDX, reg(src));
+      // TODO: check if EDX is required!
+      builder.MUL(EAX, EDX);
+      if (events[i - 2].data != 1) builder.MOV(reg(events[i - 1].data), EAX);
+      break;
+    }
+    case EQ:
+      builder.CMP(reg(events[events[i - 3].data].data),
+                  reg(events[events[i - 2].data].data));
+      break;
+    case JUMP:
+      builder.JMP((int)events[i].data - 1);
+      break;
+    case BRANCH:
+      builder.JNZ((int)events[i].data - 1);
+      break;
+    case RET:
+      if (events[events[i - 2].data].data != 1)
+        builder.MOV(EAX, reg(events[events[i - 2].data].data));
+      builder.RET();
+      break;
+    default: printf("unknown op! %02x\n", code);
+    }
+  }
+  unsigned char buffer[1024];
+  auto tmp = builder.Encode(buffer);
+  for (auto i = buffer; i < tmp; i++)
+    printf("%02x  ", *i);
 }
-}
-#endif

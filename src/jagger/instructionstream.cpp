@@ -705,7 +705,8 @@ size_t RegisterAllocator::emitTerminator(EventStream events,
         events[index++] = Event(USE, arg0);
         events[index++] = Event(PHI_COPY | GP_REGS, targetPhiIndex++);
       }
-      events[result = index++] = Event(JUMP, 0);
+      // TODO: blockID is the wrong value, we should be getting backendID
+      events[result = index++] = Event(JUMP, jump->targetBlock()->blockID());
       break;
     }
     case COP_Branch: {
@@ -713,7 +714,8 @@ size_t RegisterAllocator::emitTerminator(EventStream events,
       auto condition = branch->condition();
       index = emitEvents(events, index, condition);
       events[index++] = Event(USE, (size_t)condition->getBackendID());
-      events[result = index++] = Event(BRANCH, 0);
+      // TODO: blockID is the wrong value, we should be getting backendID
+      events[result = index++] = Event(BRANCH, branch->elseBlock()->blockID());
       break;
     }
     case COP_Return: {
@@ -737,6 +739,7 @@ void encode(SCFG* cfg, char* output) {
 
   print_stream(allocator.events, allocator.numEvents);
   print_asm(allocator.events, allocator.numEvents);
+  make_asm(allocator.events, allocator.numEvents);
   //stream.printWalks();
   //X64Builder builder;
   //emitASM(builder, InstructionStream.events.data(), InstructionStream.events.size());
