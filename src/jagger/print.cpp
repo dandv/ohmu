@@ -171,9 +171,19 @@ void make_asm(EventStream events, size_t numEvents) {
     case JUMP:
       builder.JMP((int)events[i].data - 1);
       break;
-    case BRANCH:
+    case BRANCH: {
+      auto& test = events[events[i - 1].data - 1];
+      printf("------ %d\n", events[i - 1].data);
+      if (test.data == 0) {
+        printf(">>>>>>>>> %d!\n", test.code);
+        switch (test.code) {
+        case EQ:;
+        }
+      } else {
+      }
       builder.JNZ((int)events[i].data - 1);
       break;
+    }
     case RET:
       if (events[events[i - 2].data].data != 1)
         builder.MOV(EAX, reg(events[events[i - 2].data].data));

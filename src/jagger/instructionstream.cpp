@@ -147,38 +147,6 @@ struct RegisterAllocator {
 };
 //}  // namespace
 
-#if 0
-void InstructionStream::traverse(Instruction* use, Instruction* def) {
-  Instruction* skipUntil = use;
-  auto defIndex = (int)(def - instrs);
-  auto keyIndex = defIndex + def->key;
-#if 0
-  for (Instruction* i = use - 1; i > def; --i) {
-    if (i->opcode.code == Opcode::HEADER) {
-      if (i->opcode.flags)
-        skipUntil = i + i->arg1;
-      else if (i <= skipUntil)
-        i = i + i->arg1;
-      continue;
-    }
-    if (!i->opcode.hasResult) continue;
-    if (def->key == i->key) continue;
-    auto iKeyIndex = (int)(i->getKey() - instrs);
-    interactions.push_back(std::make_pair(std::min(keyIndex, iKeyIndex),
-                                          std::max(keyIndex, iKeyIndex)));
-  }
-#else
-  for (auto instr : LiveRange(def, use)) {
-    if (!instr.opcode.aliasSet) continue;
-    if (def->key == instr.key) continue;
-    auto iKeyIndex = (int)(instr.getKey() - instrs);
-    interactions.push_back(std::make_pair(std::min(keyIndex, iKeyIndex),
-                                          std::max(keyIndex, iKeyIndex)));
-  }
-#endif
-}
-#endif
-
 void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
   if (!numCFGs) return;
 
@@ -420,8 +388,8 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
     auto b = i.second;
     i.first = events[i.first].data;
     i.second = events[i.second].data;
-    if (i.first == 49 || i.second == 49)
-      printf(">>$? %d->%d, %d->%d\n", a, i.first, b, i.second);
+    //if (i.first == 49 || i.second == 49)
+    //  printf(">>$? %d->%d, %d->%d\n", a, i.first, b, i.second);
     if (i.first > i.second)
       std::swap(i.first, i.second);
   }
@@ -468,10 +436,8 @@ void RegisterAllocator::encode(SCFG* const* cfgs, size_t numCFGs) {
     auto unpreferred = 0;
     for (size_t j = g; j < g_end && goals[j].first == i; j++)
       preferred |= sidecar[goals[j].second].preferred;
-    for (size_t j = c; j < c_end && conflicts[j].first == i; j++) {
+    for (size_t j = c; j < c_end && conflicts[j].first == i; j++)
       unpreferred |= sidecar[conflicts[j].second].preferred;
-      if (work[i].index == 76) printf("!!!!!!!! %0x\n", unpreferred);
-    }
     auto x = ~unpreferred & preferred & ~invalid;
     if (!x) x = preferred & ~invalid;
     if (!x) x = ~unpreferred & ~invalid;

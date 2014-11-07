@@ -18,14 +18,14 @@
 #pragma once
 
 enum {
-  VALUE = 0x80, PHI = 0x90, COPY = 0xa0, PHI_COPY = 0xb0,
-  FLAGS_REGS = 0x01, GP_REGS = 0x02, SSE_REGS = 0x03, X87_REGS = 0x04,
-  IS_FIXED = 0x40, USE_FIXED = VALUE | IS_FIXED,
-  VALUE_MASK = 0xf0, REGS_MASK = 0x07,
-  USE_EFLAGS = USE_FIXED | FLAGS_REGS,
-  USE_EAX = USE_FIXED | GP_REGS,
-  USE_EDX = USE_FIXED | GP_REGS | (1 << 3),
-  NOP = 0, USE, MUTED_USE, HEADER, HEADER_DOMINATES,
+  //VALUE = 0x80, PHI = 0x90, COPY = 0xa0, PHI_COPY = 0xb0,
+  //FLAGS_REGS = 0x01, GP_REGS = 0x02, SSE_REGS = 0x03, X87_REGS = 0x04,
+  //IS_FIXED = 0x40, USE_FIXED = VALUE | IS_FIXED,
+  //VALUE_MASK = 0xf0, REGS_MASK = 0x07,
+  //USE_EFLAGS = USE_FIXED | FLAGS_REGS,
+  //USE_EAX = USE_FIXED | GP_REGS,
+  //USE_EDX = USE_FIXED | GP_REGS | (1 << 3),
+  NOP = 0, USE, MUTED_USE, GOTO_HEADER, WALK_HEADER,
   INT32, LOAD, STORE, ULOAD, USTORE, GATHER, SCATTER,
   SEXT, ZEXT, FCVT, /* ZEXT/FCVT used for truncation */
   AND, OR, ANDN, ORN, XOR, XNOR, NAND, NOR, NOT,
@@ -45,68 +45,69 @@ enum {
   MEMSET, MEMCPY,
 };
 
-typedef unsigned char Opcode;
-typedef unsigned int Data;
+typedef unsigned int uint;
 
 struct Event {
-  Event() {}
-  Event(Opcode code, Data data) : code(code), data(data) {}
-#ifdef _M_X64
-  Event(Opcode code, size_t data) : code(code), data((Data)data) {
-    assert(this->data == data);
-  }
-#endif
-  Opcode code;
-  Data data;
+  enum AliasSet { GPR = 1, FLAGS, MMX, SSE };
+  enum {
+    VALUE = 0x80,
+    FIXED = VALUE | 0x40,
+    COPY = VALUE | 0x20,
+    PHI = VALUE | 0x10,
+    PHI_COPY = PHI | COPY,
+    EAX = GPR,
+    EDX = GPR | 0x8,
+  };
+
+  Event(unsigned char code, unsigned data) : code(code), data(data) {}
+
+  static inline size_t initNop(Event* events, size_t i, uint payload = 0);
+  static inline size_t initGotoHeader(Event* events, size_t i, uint target);
+  static inline size_t initWalkHeader(Event* events, size_t i, uint target);
+  static inline size_t initPhi(Event* events, size_t i);
+  static inline size_t initPhiCopy(Event* events, size_t i, uint arg0, uint phi);
+  static inline size_t initJump(Event* events, size_t i, uint target);
+  static inline size_t initBranch(Event* events, size_t i, uint arg0, uint thenTarget, uint elseTarget);
+  static inline size_t initRet(Event* events, size_t i, uint arg0);
+  static inline size_t initIntLiteral(Event* events, size_t i, int value);
+  static inline size_t initAdd(Event* events, size_t i, uint arg0, uint arg1);
+  static inline size_t initSub(Event* events, size_t i, uint arg0, uint arg1);
+  static inline size_t initMul(Event* events, size_t i, uint arg0, uint arg1);
+  static inline size_t initEq(Event* events, size_t i, uint arg0, uint arg1);
+  static inline size_t initLt(Event* events, size_t i, uint arg0, uint arg1);
+  static inline size_t initLe(Event* events, size_t i, uint arg0, uint arg1);
+
+  union {
+    unsigned bits;
+    unsigned char code;
+    struct {
+      unsigned char aliasSet : 3;
+      unsigned char : 1;
+      unsigned char isPhiKind : 1;
+      unsigned char isCopy : 1;
+      unsigned char isFixed : 1;
+      unsigned char isValue : 1;
+    };
+    struct {
+      unsigned char /*aliasSet*/ : 3;
+      unsigned char fixedReg : 3;
+      unsigned char /*isFixed*/ : 1;
+      unsigned char /*isValue*/ : 1;
+    };
+    struct {
+      unsigned : 8;
+      unsigned data : 24;
+    };
+  };
 };
 
-struct EventRef {
-  EventRef(Opcode& code, Data& data, size_t index)
-    : code(code), data(data) {}//, index(index) {}
-  EventRef& operator=(Event Event) {
-    code = Event.code;
-    data = Event.data;
-    return *this;
-  }
-  Opcode& code;
-  Data& data;
-  //size_t index;
-  //EventRef prior() const {
-  //  return EventRef((&code)[-1], (&data)[-1], index - 1);
-  //}
-};
+static const size_t MAX_EVENTS = 1 << 24;
 
-struct EventStream {
-  EventRef operator[](size_t index) const {
-    return EventRef(codes[index], data[index], index);
-  }
-  Opcode* codes;
-  Data* data;
-};
-
-struct Block {
-  Block* dominator;
-  Block* head;
-  size_t firstEvent;
-  size_t numEvents;
-};
-
-struct Work {
-  explicit Work(Data index) : index(index) {}
-  bool operator <(const Work& a) const { return count < a.count; }
-  Data count;
-  Data index;
-};
-
-struct Sidecar {
-  Sidecar() : preferred(0), invalid(0) {}
-  Data preferred;
-  Data invalid;
-};
-
+#if 0
 void print_stream(EventStream events, size_t numInstrs);
 void print_asm(EventStream events, size_t numInstrs);
 void make_asm(EventStream events, size_t numEvents);
+#endif
 
 #if 0
 // EQ_OQ(EQ) 0H Equal(ordered, non - signaling) False False True False No
