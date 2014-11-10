@@ -374,7 +374,7 @@ protected:
       if (isa<Wildcard>(E->record())) {
         // handle existentials
         SS << "&";
-        SS << E->clangDecl()->getQualifiedNameAsString();
+        //SS << E->clangDecl()->getQualifiedNameAsString();
         return;
       }
     }
